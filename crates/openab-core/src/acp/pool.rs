@@ -9,6 +9,19 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+#[cfg(feature = "acp-mcp")]
+struct ActiveRequestGuard {
+    registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar>,
+    token: String,
+}
+
+#[cfg(feature = "acp-mcp")]
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.registrar.clear_request(&self.token);
+    }
+}
+
 /// Error substrings produced by `AcpConnection::send_request` that indicate a
 /// transient failure worth preserving the session ID for retry, as opposed to
 /// a permanent agent-side rejection.
@@ -493,7 +506,7 @@ impl SessionPool {
         let mut session_token: Option<String> = None;
         #[cfg(feature = "acp-mcp")]
         let facade_token_guard: Option<tokio_util::sync::DropGuard> = match (
-            thread_id.strip_prefix("acp:"),
+            Some(thread_id.strip_prefix("acp:").unwrap_or(thread_id)),
             self.session_registrar.as_ref(),
             self.facade_url.as_ref(),
         ) {
@@ -735,6 +748,63 @@ impl SessionPool {
         };
 
         let mut conn = conn.lock().await;
+        f(&mut conn).await
+    }
+
+    /// Like `with_connection`, but binds trusted request identity only after
+    /// acquiring the per-session mutex. This ordering prevents a queued turn
+    /// from replacing the active turn's identity.
+    pub async fn with_connection_context<F, R>(
+        &self,
+        thread_id: &str,
+        context: Option<openab_context::ResolvedRequestContext>,
+        f: F,
+    ) -> Result<R>
+    where
+        F: for<'a> FnOnce(
+            &'a mut AcpConnection,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<R>> + Send + 'a>,
+        >,
+    {
+        let (conn, token) = {
+            let state = self.state.read().await;
+            let conn = state
+                .active
+                .get(thread_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no connection for thread {}",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?;
+            #[cfg(feature = "acp-mcp")]
+            let token = state.facade_tokens.get(thread_id).cloned();
+            #[cfg(not(feature = "acp-mcp"))]
+            let token: Option<String> = None;
+            (conn, token)
+        };
+        #[cfg(not(feature = "acp-mcp"))]
+        let _ = &token;
+        #[cfg(not(feature = "acp-mcp"))]
+        let _ = &context;
+        let mut conn = conn.lock().await;
+        #[cfg(feature = "acp-mcp")]
+        let _guard = match (
+            context,
+            token,
+            self.session_registrar.as_ref(),
+        ) {
+            (Some(context), Some(token), Some(registrar)) => {
+                registrar.activate_request(&token, context);
+                Some(ActiveRequestGuard {
+                    registrar: Arc::clone(registrar),
+                    token,
+                })
+            }
+            _ => None,
+        };
         f(&mut conn).await
     }
 

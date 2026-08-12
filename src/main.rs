@@ -1,4 +1,5 @@
 mod ctl;
+mod facade_registrar;
 #[cfg(any(
     feature = "telegram",
     feature = "line",
@@ -526,7 +527,6 @@ async fn main() -> anyhow::Result<()> {
     // via broker-minted tokens; no per-session proxy servers.
     let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
     // Only read under the acp feature (pool facade wiring below).
-    #[cfg(feature = "acp")]
     let facade_serving = cfg.mcp.is_some();
     // Startup, not per-session: report whether the facade is serving, so an operator learns it
     // here rather than by inferring it from tools that never appear. This is NOT the
@@ -534,7 +534,6 @@ async fn main() -> anyhow::Result<()> {
     // reports the variable now.
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
-    #[cfg(feature = "acp")]
     openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
@@ -570,10 +569,9 @@ async fn main() -> anyhow::Result<()> {
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
     // no registrar and no facade url, and the pool simply starts sessions without browser
     // capabilities — there is no longer a proxy path for it to fall back to.
-    #[cfg(feature = "acp")]
     let pool_inner = pool_inner.with_facade_sessions(
         facade_serving.then(|| {
-            Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
+            Arc::new(facade_registrar::FacadeRegistrar(facade_sessions.clone()))
                 as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
         }),
         facade_serving.then(|| {
@@ -855,6 +853,17 @@ async fn main() -> anyhow::Result<()> {
         reg
     };
 
+    let identity_runtime = cfg.identity.as_ref().map(|identity| {
+        (
+            Arc::new(openab_core::identity::MappingIdentityResolver::new(identity))
+                as Arc<dyn openab_context::IdentityResolver>,
+            identity.agent_id.clone(),
+        )
+    });
+    let (identity_resolver, agent_identity) = identity_runtime
+        .map(|(resolver, agent)| (Some(resolver), Some(agent)))
+        .unwrap_or((None, None));
+
     let router = Arc::new(
         AdapterRouter::new(
             pool.clone(),
@@ -871,7 +880,8 @@ async fn main() -> anyhow::Result<()> {
                 "/tmp".into()
             })),
         )
-        .with_trust(gateway_trust),
+        .with_trust(gateway_trust)
+        .with_identity(identity_resolver, agent_identity),
     );
 
     // Shutdown signal for Slack adapter

@@ -55,6 +55,9 @@ pub struct BufferedMessage {
     /// mode's native streaming is active. `None` for non-Slack platforms and
     /// bot-authored turns.
     pub recipient: Option<(String, String)>,
+    /// Trusted broker-side identity for this arrival. When present the
+    /// dispatcher keeps this arrival in its own ACP turn.
+    pub request_context: Option<openab_context::ResolvedRequestContext>,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -148,6 +151,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        request_context: Option<openab_context::ResolvedRequestContext>,
     ) -> Result<()>;
 }
 
@@ -182,6 +186,7 @@ impl DispatchTarget for AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        request_context: Option<openab_context::ResolvedRequestContext>,
     ) -> Result<()> {
         AdapterRouter::stream_prompt_blocks(
             self,
@@ -192,6 +197,7 @@ impl DispatchTarget for AdapterRouter {
             reactions,
             other_bot_present,
             recipient,
+            request_context,
         )
         .await
     }
@@ -582,6 +588,13 @@ async fn consumer_loop(
         while batch.len() < max_batch {
             match rx.try_recv() {
                 Ok(more) => {
+                    // One downstream authorization principal per ACP turn.
+                    // Identity-enabled arrivals are never coalesced, even for
+                    // the same human, because each carries a unique request_id.
+                    if batch[0].request_context.is_some() || more.request_context.is_some() {
+                        pending = Some(more);
+                        break;
+                    }
                     if cumulative_tokens + more.estimated_tokens > max_tokens {
                         // Token cap — save for next turn (FIFO preserved).
                         pending = Some(more);
@@ -647,6 +660,7 @@ async fn dispatch_batch(
     // Native-streaming recipient is bound to the turn (captured per-message). A
     // batch attributes to the most recent sender; None for non-Slack/bot turns.
     let recipient: Option<(String, String)> = batch.last().and_then(|m| m.recipient.clone());
+    let request_context = batch.last().and_then(|m| m.request_context.clone());
 
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
@@ -753,6 +767,15 @@ async fn dispatch_batch(
     for msg in batch {
         let mut event_blocks =
             AdapterRouter::pack_arrival_event(&msg.sender_json, &msg.prompt, msg.extra_blocks);
+        if let Some(request) = &msg.request_context {
+            event_blocks.insert(1, ContentBlock::Text {
+                text: format!(
+                    "<request_context>\n{}\n</request_context>",
+                    serde_json::to_string(&request.request)
+                        .expect("request context is serializable")
+                ),
+            });
+        }
         content_blocks.append(&mut event_blocks);
     }
     let packed_block_count = content_blocks.len();
@@ -776,6 +799,7 @@ async fn dispatch_batch(
             reactions.clone(),
             other_bot_present,
             recipient,
+            request_context,
         )
         .await;
 
@@ -1432,6 +1456,7 @@ mod tests {
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
+            _request_context: Option<openab_context::ResolvedRequestContext>,
         ) -> Result<()> {
             self.calls.lock().unwrap().push(RecordedDispatch {
                 block_count: content_blocks.len(),
@@ -1511,7 +1536,50 @@ mod tests {
             estimated_tokens: tokens,
             other_bot_present: false,
             recipient: None,
+            request_context: None,
         }
+    }
+
+    fn with_request_context(
+        mut msg: BufferedMessage,
+        request_id: &str,
+        subject: &str,
+    ) -> BufferedMessage {
+        msg.request_context = Some(openab_context::ResolvedRequestContext {
+            request: openab_context::RequestContext {
+                request_id: request_id.into(),
+                source: openab_context::SourceContext {
+                    kind: "slack".into(),
+                    workspace_id: Some("T1".into()),
+                    channel_id: "C1".into(),
+                },
+                human_identity: openab_context::HumanIdentity {
+                    external_id: subject.into(),
+                },
+                agent_identity: openab_context::AgentIdentity { id: "suma".into() },
+                session_id: "thread-1".into(),
+            },
+            identity: openab_context::NormalizedIdentity {
+                subject: subject.into(),
+                groups: vec![],
+            },
+        });
+        msg
+    }
+
+    #[tokio::test]
+    async fn identity_enabled_arrivals_are_never_coalesced_into_one_turn() {
+        let calls = run_consumer_with_messages(
+            vec![
+                with_request_context(make_msg("cloud", 1), "req-a", "employee-001"),
+                with_request_context(make_msg("hr", 1), "req-b", "employee-002"),
+            ],
+            10,
+            100,
+        )
+        .await;
+        assert_eq!(calls.len(), 2, "one authorization principal per ACP turn");
+        assert!(calls.iter().all(|call| call.block_count == 3));
     }
 
     /// Pre-load `msgs` into a fresh mpsc, drop the sender, and run

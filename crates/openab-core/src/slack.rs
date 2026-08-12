@@ -1795,6 +1795,19 @@ async fn handle_message(
         .thread_id
         .as_deref()
         .unwrap_or(&thread_channel.channel_id);
+    let request_context = if is_bot_msg {
+        None
+    } else {
+        router.resolve_request_context(
+            openab_context::SourceContext {
+                kind: "slack".into(),
+                workspace_id: Some(team_id.to_string()),
+                channel_id: channel_id.clone(),
+            },
+            user_id.clone(),
+            thread_id.to_string(),
+        )
+    };
     let thread_key = dispatcher.key("slack", thread_id, &sender.sender_id);
     let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
     let buf_msg = crate::dispatch::BufferedMessage {
@@ -1807,6 +1820,7 @@ async fn handle_message(
         estimated_tokens,
         other_bot_present,
         recipient: stream_recipient,
+        request_context,
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)

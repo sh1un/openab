@@ -37,6 +37,8 @@ use serde_json::{Map, Value};
 pub struct SessionCtx {
     /// The chat-session/channel id the broker keyed this session by.
     pub channel_id: String,
+    /// Present only while the broker is executing one serialized ACP turn.
+    pub request: Option<openab_context::ResolvedRequestContext>,
 }
 
 /// An in-process capability provider behind the facade.
@@ -118,6 +120,7 @@ impl SessionTokens {
             token.clone(),
             SessionCtx {
                 channel_id: channel_id.to_string(),
+                request: None,
             },
         );
         token
@@ -145,6 +148,22 @@ impl SessionTokens {
             .write()
             .expect("session token lock")
             .remove(token);
+    }
+
+    pub fn activate_request(
+        &self,
+        token: &str,
+        request: openab_context::ResolvedRequestContext,
+    ) {
+        if let Some(ctx) = self.inner.write().expect("session token lock").get_mut(token) {
+            ctx.request = Some(request);
+        }
+    }
+
+    pub fn clear_request(&self, token: &str) {
+        if let Some(ctx) = self.inner.write().expect("session token lock").get_mut(token) {
+            ctx.request = None;
+        }
     }
 
     /// Resolve a presented token. Constant-time comparison over stored
@@ -200,6 +219,54 @@ pub fn session_ctx_from_extensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(request_id: &str, subject: &str) -> openab_context::ResolvedRequestContext {
+        openab_context::ResolvedRequestContext {
+            request: openab_context::RequestContext {
+                request_id: request_id.into(),
+                source: openab_context::SourceContext {
+                    kind: "slack".into(),
+                    workspace_id: Some("T1".into()),
+                    channel_id: "C1".into(),
+                },
+                human_identity: openab_context::HumanIdentity {
+                    external_id: format!("U-{subject}"),
+                },
+                agent_identity: openab_context::AgentIdentity { id: "suma".into() },
+                session_id: format!("thread-{subject}"),
+            },
+            identity: openab_context::NormalizedIdentity {
+                subject: subject.into(),
+                groups: vec![subject.into()],
+            },
+        }
+    }
+
+    #[test]
+    fn concurrent_session_tokens_keep_request_identity_isolated() {
+        let tokens = SessionTokens::new();
+        let cloud_token = tokens.mint("session-cloud");
+        let hr_token = tokens.mint("session-hr");
+        tokens.activate_request(&cloud_token, request("req-cloud", "employee-001"));
+        tokens.activate_request(&hr_token, request("req-hr", "employee-002"));
+
+        assert_eq!(
+            tokens.resolve(&cloud_token).unwrap().request.unwrap().identity.subject,
+            "employee-001"
+        );
+        assert_eq!(
+            tokens.resolve(&hr_token).unwrap().request.unwrap().identity.subject,
+            "employee-002"
+        );
+
+        tokens.clear_request(&cloud_token);
+        assert!(tokens.resolve(&cloud_token).unwrap().request.is_none());
+        assert_eq!(
+            tokens.resolve(&hr_token).unwrap().request.unwrap().identity.subject,
+            "employee-002",
+            "clearing session A must not change session B"
+        );
+    }
 
     /// Two builders racing for one channel must not invalidate each other (review round 4, T1).
     ///

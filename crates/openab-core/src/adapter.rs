@@ -1,5 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use openab_context::{
+    AgentIdentity, HumanIdentity, IdentityResolver, RequestContext, ResolvedRequestContext,
+    SourceContext,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
@@ -270,6 +274,7 @@ pub struct MessageContext {
     pub extra_blocks: Vec<ContentBlock>,
     pub trigger_msg: MessageRef,
     pub other_bot_present: bool,
+    pub request_context: Option<ResolvedRequestContext>,
 }
 
 /// Sender identity injected into prompts for downstream agent context.
@@ -464,6 +469,8 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    identity_resolver: Option<Arc<dyn IdentityResolver>>,
+    agent_identity: Option<AgentIdentity>,
 }
 
 impl AdapterRouter {
@@ -494,7 +501,44 @@ impl AdapterRouter {
             workspace_aliases,
             bot_home,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            identity_resolver: None,
+            agent_identity: None,
         }
+    }
+
+    pub fn with_identity(
+        mut self,
+        resolver: Option<Arc<dyn IdentityResolver>>,
+        agent_id: Option<String>,
+    ) -> Self {
+        self.identity_resolver = resolver;
+        self.agent_identity = agent_id
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| AgentIdentity { id });
+        self
+    }
+
+    /// Build trusted context exclusively from authenticated adapter fields.
+    pub fn resolve_request_context(
+        &self,
+        source: SourceContext,
+        external_id: String,
+        session_id: String,
+    ) -> Option<ResolvedRequestContext> {
+        let resolver = self.identity_resolver.as_ref()?;
+        let agent_identity = self.agent_identity.clone()?;
+        let human_identity = HumanIdentity { external_id };
+        let identity = resolver.resolve(&source, &human_identity)?;
+        Some(ResolvedRequestContext {
+            request: RequestContext {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                source,
+                human_identity,
+                agent_identity,
+                session_id,
+            },
+            identity,
+        })
     }
 
     /// Attach the per-platform trust registry (builder style, before `Arc`-wrapping).
@@ -584,8 +628,13 @@ impl AdapterRouter {
     ) -> Result<()> {
         tracing::debug!(platform = adapter.platform(), "processing message");
 
-        let content_blocks =
+        let mut content_blocks =
             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
+        if let Some(request) = &ctx.request_context {
+            content_blocks.insert(1, ContentBlock::Text {
+                text: format!("<request_context>\n{}\n</request_context>", serde_json::to_string(&request.request)?),
+            });
+        }
 
         let thread_key = format!(
             "{}:{}",
@@ -622,13 +671,17 @@ impl AdapterRouter {
         }
 
         let result = self
-            .stream_prompt(
+            .stream_prompt_blocks(
                 adapter,
                 &thread_key,
                 content_blocks,
                 &ctx.thread_channel,
                 reactions.clone(),
                 ctx.other_bot_present,
+                // handle_message path (e.g. cron) is never Slack assistant-mode
+                // native streaming, so there is no per-turn recipient.
+                None,
+                ctx.request_context,
             )
             .await;
 
@@ -661,29 +714,6 @@ impl AdapterRouter {
         result
     }
 
-    async fn stream_prompt(
-        &self,
-        adapter: &Arc<dyn ChatAdapter>,
-        thread_key: &str,
-        content_blocks: Vec<ContentBlock>,
-        thread_channel: &ChannelRef,
-        reactions: Arc<StatusReactionController>,
-        other_bot_present: bool,
-    ) -> Result<()> {
-        self.stream_prompt_blocks(
-            adapter,
-            thread_key,
-            content_blocks,
-            thread_channel,
-            reactions,
-            other_bot_present,
-            // handle_message path (e.g. cron) is never Slack assistant-mode native
-            // streaming, so no per-turn recipient — degrades to post+edit if it were.
-            None,
-        )
-        .await
-    }
-
     /// Drive one ACP turn with the given pre-packed ContentBlocks.
     /// Called by both `handle_message` (per-message mode) and `dispatch::dispatch_batch`
     /// (batched mode).
@@ -697,6 +727,7 @@ impl AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        request_context: Option<ResolvedRequestContext>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
@@ -736,7 +767,7 @@ impl AdapterRouter {
         let liveness_check_interval = self.liveness_check_interval;
 
         self.pool
-            .with_connection(thread_key, |conn| {
+            .with_connection_context(thread_key, request_context, |conn| {
                 let content_blocks = content_blocks.clone();
                 Box::pin(async move {
                     let reset = conn.session_reset;

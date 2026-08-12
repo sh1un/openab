@@ -111,6 +111,23 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 
 ---
 
+## `[identity]` (PoC)
+
+Optional end-user identity propagation for contextual downstream authorization.
+Absent by default, so existing deployments do not resolve or forward identity.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `agent_id` | string | *required when present* | Stable generic identity of the agent acting for the human. |
+| `mappings.<source>.<external_id>.subject` | string | *required* | Normalized non-PII subject used by downstream policy. Empty subjects fail closed. |
+| `mappings.<source>.<external_id>.groups` | string[] | `[]` | Groups supplied as downstream authorization claims. For Slack, `external_id` is the authenticated `U...` event user ID. |
+
+See [End-User Identity Propagation PoC](end-user-identity-propagation-poc.md)
+for complete configuration, AgentCore adapter setup, security properties, and
+demo instructions.
+
+---
+
 ## `[gateway]`
 
 Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Google Chat. Connects to the gateway via WebSocket.

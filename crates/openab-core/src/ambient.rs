@@ -643,6 +643,7 @@ async fn ambient_consumer_loop(
                 reactions,
                 false, // other_bot_present
                 None,  // no streaming recipient
+                None,  // ambient events have no human request identity
             )
             .await
         {

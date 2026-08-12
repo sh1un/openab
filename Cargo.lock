@@ -2509,6 +2509,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "openab-context",
  "openab-core",
  "openab-gateway",
  "openab-mcp",
@@ -2520,6 +2521,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openab-context"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -2546,6 +2554,7 @@ dependencies = [
  "http 1.4.2",
  "image",
  "libc",
+ "openab-context",
  "pulldown-cmark",
  "rand 0.8.6",
  "regex",
@@ -2618,9 +2627,11 @@ dependencies = [
  "getrandom 0.4.3",
  "http-body-util",
  "jsonschema",
+ "jsonwebtoken",
  "libc",
  "oauth2",
  "open",
+ "openab-context",
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rmcp",

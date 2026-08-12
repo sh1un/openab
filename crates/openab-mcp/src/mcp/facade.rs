@@ -142,11 +142,45 @@ fn published_name(server: &str, tool: &str, duplicated: bool) -> String {
 /// fails the sweep: it is reported in the returned `unavailable` list with
 /// its concise, redacted error (ADR §11 "one provider failure does not
 /// prevent the other provider from connecting").
-async fn collect_capabilities(manager: &McpRuntimeManager) -> (Vec<Capability>, Vec<Value>) {
+async fn collect_capabilities(
+    manager: &McpRuntimeManager,
+    ctx: Option<&SessionCtx>,
+) -> (Vec<Capability>, Vec<Value>) {
     let mut fetched: Vec<(String, Vec<Tool>)> = Vec::new();
     let mut unavailable: Vec<Value> = Vec::new();
     for entry in manager.catalog() {
-        match meta_tool::fetch_tools(manager, &entry.name).await {
+        let contextual = manager.requires_request_context(&entry.name).await;
+        let scoped;
+        let selected = if contextual {
+            let Some(request) = ctx.and_then(|c| c.request.as_ref()) else {
+                unavailable.push(json!({
+                    "provider": entry.name,
+                    "error": "authenticated human request context required",
+                }));
+                continue;
+            };
+            match manager.contextual_runtime(&entry.name, request).await {
+                Ok(Some(runtime)) => {
+                    scoped = runtime;
+                    &scoped
+                }
+                Ok(None) => manager,
+                Err(e) => {
+                    unavailable.push(json!({
+                        "provider": entry.name,
+                        "error": super::redact_secrets(&super::concise_error_message(&e)),
+                    }));
+                    continue;
+                }
+            }
+        } else {
+            manager
+        };
+        let fetch_result = meta_tool::fetch_tools(selected, &entry.name).await;
+        if contextual {
+            let _ = selected.disconnect(&entry.name).await;
+        }
+        match fetch_result {
             Ok(tools) => fetched.push((entry.name.clone(), tools)),
             Err(e) => unavailable.push(json!({
                 "provider": entry.name,
@@ -182,7 +216,7 @@ impl McpFacade {
         ctx: Option<&SessionCtx>,
     ) -> Result<Value> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let (capabilities, unavailable) = collect_capabilities(&self.manager).await;
+        let (capabilities, unavailable) = collect_capabilities(&self.manager, ctx).await;
         let mut entries: Vec<Value> = capabilities
             .iter()
             .filter(|c| matches_query(&c.name, c.tool.description.as_deref(), query))
@@ -249,9 +283,9 @@ impl McpFacade {
         // publish rule — downstream servers win bare names, so a source
         // tool shadowed in discovery must also be shadowed in execution
         // (it is reachable via its published "<provider>:<tool>" name).
-        let (capabilities, _) = collect_capabilities(&self.manager).await;
+        let (capabilities, _) = collect_capabilities(&self.manager, ctx).await;
         if let Some(cap) = capabilities.iter().find(|c| c.name == name) {
-            return self.dispatch_downstream(cap, arguments).await;
+            return self.dispatch_downstream(cap, arguments, ctx).await;
         }
         // In-process sources: bare name (when unshadowed) or the
         // "<provider>:<tool>" published form. Session-bound sources are
@@ -322,20 +356,40 @@ impl McpFacade {
         &self,
         cap: &Capability,
         arguments: Value,
+        ctx: Option<&SessionCtx>,
     ) -> Result<(Value, bool)> {
         // Delegate to the shared dispatcher: tool_filter gate, JSON Schema
         // argument validation, timeout/cancellation, circuit breaker, and
         // redaction all live there (single enforcement point for both the
         // meta-tool and the facade).
-        let (value, is_error) = meta_tool::dispatch(
-            &self.manager,
+        let contextual = self.manager.requires_request_context(&cap.server).await;
+        let scoped;
+        let manager = if contextual {
+            let request = ctx
+                .and_then(|c| c.request.as_ref())
+                .context("authenticated human request context required")?;
+            scoped = self
+                .manager
+                .contextual_runtime(&cap.server, request)
+                .await?
+                .context("credential provider missing")?;
+            &scoped
+        } else {
+            &self.manager
+        };
+        let result = meta_tool::dispatch(
+            manager,
             Action::Call {
                 server: cap.server.clone(),
                 tool: cap.tool.name.to_string(),
                 arguments,
             },
         )
-        .await?;
+        .await;
+        if contextual {
+            let _ = manager.disconnect(&cap.server).await;
+        }
+        let (value, is_error) = result?;
         Ok((value, is_error.unwrap_or(false)))
     }
 }
@@ -594,6 +648,7 @@ mod tests {
         let facade = facade_with_source(true);
         let ctx = super::SessionCtx {
             channel_id: "chan-42".into(),
+            request: None,
         };
         let v = facade
             .search_capabilities(&Map::new(), Some(&ctx))

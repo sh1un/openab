@@ -654,6 +654,7 @@ impl McpRuntimeManager {
             return Ok(Dial::Http {
                 url: url.to_string(),
                 client: Some(client),
+                bearer_token: None,
             });
         }
         if !has_refresh {
@@ -708,6 +709,7 @@ impl McpRuntimeManager {
         Ok(Dial::Http {
             url: url.to_string(),
             client: Some(client),
+            bearer_token: None,
         })
     }
 
@@ -757,6 +759,42 @@ impl McpRuntimeManager {
 
     pub async fn is_empty(&self) -> bool {
         self.handles.read().await.is_empty()
+    }
+
+    pub async fn contextual_runtime(
+        &self,
+        name: &str,
+        context: &openab_context::ResolvedRequestContext,
+    ) -> Result<Option<Self>> {
+        let mut server = {
+            let guard = self.handles.read().await;
+            guard.get(name).map(|h| h.config.clone())
+        }
+        .ok_or_else(|| anyhow!("no mcp server named {name:?}"))?;
+        let Some(provider_config) = server.credential_provider().cloned() else {
+            return Ok(None);
+        };
+        let credential = super::credential::from_config(&provider_config)?.credential(context)?;
+        if let ServerConfig::Http {
+            credential_provider,
+            bearer_token,
+            ..
+        } = &mut server
+        {
+            *credential_provider = None;
+            *bearer_token = Some(credential);
+        }
+        let mut config = McpConfig::default();
+        config.servers.insert(name.to_string(), server);
+        Ok(Some(Self::from_config(config)))
+    }
+
+    pub async fn requires_request_context(&self, name: &str) -> bool {
+        self.handles
+            .read()
+            .await
+            .get(name)
+            .is_some_and(|h| h.config.credential_provider().is_some())
     }
 
     /// Clone the live MCP client handle for `name` out from under a short
@@ -1437,7 +1475,19 @@ impl McpRuntimeManager {
                     oauth: Some(_),
                     ..
                 } => DialPlan::OauthHttp { url },
-                ServerConfig::Http { url, .. } => DialPlan::Dial(Dial::Http { url, client: None }),
+                ServerConfig::Http {
+                    url: _,
+                    credential_provider: Some(_),
+                    bearer_token: None,
+                    ..
+                } => return Err(anyhow!(
+                    "mcp server {name:?} requires authenticated request context through the OAB MCP Facade"
+                )),
+                ServerConfig::Http { url, bearer_token, .. } => DialPlan::Dial(Dial::Http {
+                    url,
+                    client: None,
+                    bearer_token,
+                }),
             };
             handle.status = ServerStatus::Connecting;
             plan
@@ -1938,6 +1988,7 @@ enum Dial {
         /// rmcp OAuth client for oauth-protected servers (injects the bearer
         /// per request and refreshes as needed); `None` for anonymous HTTP.
         client: Option<AuthClient<reqwest013::Client>>,
+        bearer_token: Option<String>,
     },
 }
 
@@ -2027,7 +2078,7 @@ impl Dial {
             // `with_client` yields a transport parameterised by the OAuth client,
             // a different type than the default `from_uri` transport, so each arm
             // runs `serve` itself rather than unifying to a single value.
-            Dial::Http { url, client } => match client {
+            Dial::Http { url, client, bearer_token } => match client {
                 Some(client) => {
                     let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
                     let transport = StreamableHttpClientTransport::with_client(client, cfg);
@@ -2043,7 +2094,11 @@ impl Dial {
                     .with_context(|| format!("mcp handshake with {url:?}"))
                 }
                 None => {
-                    let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                    let mut cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                    if let Some(token) = bearer_token {
+                        cfg = cfg.auth_header(token);
+                    }
+                    let transport = StreamableHttpClientTransport::from_config(cfg);
                     OpenabClientHandler::new(
                         name.to_string(),
                         tools_cache,

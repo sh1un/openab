@@ -1186,6 +1186,7 @@ pub async fn run_gateway_adapter(
                                             // TODO: implement gateway multibot detection
                                             other_bot_present: false,
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
+                                            request_context: None,
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1636,6 +1637,7 @@ pub async fn process_gateway_event(
             estimated_tokens,
             other_bot_present: false,
             recipient: None,
+                                            request_context: None,
         };
         if let Err(e) = dispatcher
             .submit(thread_key, thread_channel, adapter, buf_msg)

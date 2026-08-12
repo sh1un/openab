@@ -12,6 +12,7 @@ pub mod error_display;
 pub mod format;
 pub mod gateway;
 pub mod hooks;
+pub mod identity;
 pub mod markdown;
 pub mod media;
 pub mod multibot_cache;

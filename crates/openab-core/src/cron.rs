@@ -746,6 +746,7 @@ async fn fire_cronjob(
                 extra_blocks: vec![],
                 trigger_msg,
                 other_bot_present: false,
+                request_context: None,
             },
         )
         .await

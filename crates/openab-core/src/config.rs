@@ -248,6 +248,9 @@ pub struct Config {
     /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
     /// the opt-in signal: absent = no facade, no listener, no new behavior.
     pub mcp: Option<McpFacadeConfig>,
+    /// Optional end-user identity propagation. Absent preserves the previous
+    /// behavior: no request identity is resolved or sent downstream.
+    pub identity: Option<IdentityPropagationConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -271,6 +274,22 @@ pub struct Config {
     /// Optional filestore configuration for uploading large text attachments.
     #[cfg(feature = "filestore")]
     pub filestore: Option<FilestoreConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityPropagationConfig {
+    /// Stable identity of the configured agent acting for the human.
+    pub agent_id: String,
+    /// Source type -> authenticated external user id -> normalized identity.
+    #[serde(default)]
+    pub mappings: HashMap<String, HashMap<String, IdentityMapping>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityMapping {
+    pub subject: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

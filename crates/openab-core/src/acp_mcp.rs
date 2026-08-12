@@ -214,6 +214,17 @@ pub trait SessionTokenRegistrar: Send + Sync {
     /// credential with it and silently cut the new agent off from the facade; revoking this exact
     /// token is a no-op by then instead (review R1).
     fn revoke(&self, token: &str);
+    /// Bind trusted identity to this session credential for one serialized ACP
+    /// turn. Implementations must replace only this token's context.
+    fn activate_request(
+        &self,
+        _token: &str,
+        _context: openab_context::ResolvedRequestContext,
+    ) {
+    }
+    /// Clear the turn-scoped identity. Called by an RAII guard on success,
+    /// error, cancellation, and task abort.
+    fn clear_request(&self, _token: &str) {}
 }
 
 /// Report, once at startup, whether browser control is enabled.

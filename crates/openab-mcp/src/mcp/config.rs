@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::credential::CredentialProviderConfig;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
     #[serde(rename = "mcpServers", default)]
@@ -79,6 +81,14 @@ pub enum ServerConfig {
         url: String,
         #[serde(default)]
         oauth: Option<OAuthConfig>,
+        /// Optional per-request downstream credential adapter. Such a server
+        /// is available only through the authenticated OAB MCP Facade.
+        #[serde(default)]
+        credential_provider: Option<Box<CredentialProviderConfig>>,
+        /// Internal bearer populated from `credential_provider` for an
+        /// ephemeral, request-scoped runtime. Not accepted from JSON config.
+        #[serde(skip)]
+        bearer_token: Option<String>,
         #[serde(default, rename = "tool_filter")]
         tool_filter: Option<ToolFilter>,
         #[serde(default = "default_request_timeout_secs")]
@@ -116,6 +126,15 @@ impl ServerConfig {
     /// the LLM should ask the user to run `mcp login <name>` before calling.
     pub fn requires_oauth(&self) -> bool {
         matches!(self, ServerConfig::Http { oauth: Some(_), .. })
+    }
+
+    pub fn credential_provider(&self) -> Option<&CredentialProviderConfig> {
+        match self {
+            ServerConfig::Http {
+                credential_provider, ..
+            } => credential_provider.as_deref(),
+            ServerConfig::Stdio { .. } => None,
+        }
     }
 
     /// The operator-configured `tool_filter` for this server, if any.
@@ -492,10 +511,17 @@ impl ServerConfig {
     }
 
     fn resolved_with_env(&self, name: &str, env: &HashMap<String, String>) -> Result<Self> {
+        let bearer = match self {
+            ServerConfig::Http { bearer_token, .. } => bearer_token.clone(),
+            ServerConfig::Stdio { .. } => None,
+        };
         let json = serde_json::to_value(self)?;
         let resolved = interpolate_value(json, env)
             .with_context(|| format!("resolve env for mcp server {name:?}"))?;
-        let resolved: Self = serde_json::from_value(resolved)?;
+        let mut resolved: Self = serde_json::from_value(resolved)?;
+        if let ServerConfig::Http { bearer_token, .. } = &mut resolved {
+            *bearer_token = bearer;
+        }
         // C5 defense-in-depth: re-validate URL schemes on the substituted
         // values, since boot-time `validate` tolerated `${env:..}` placeholders.
         if let ServerConfig::Http {
@@ -558,6 +584,27 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_agentcore_credential_provider_with_short_lived_default() {
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": "https://gateway.example/mcp",
+            "credential_provider": {
+                "type": "agentcore_gateway",
+                "issuer": "https://issuer.example",
+                "audience": "source-gateway",
+                "client_id": "openab",
+                "private_key_env": "OPENAB_IDENTITY_SIGNING_KEY",
+                "key_id": "poc-key"
+            }
+        }))
+        .unwrap();
+
+        let CredentialProviderConfig::AgentcoreGateway { ttl_seconds, .. } =
+            server.credential_provider().unwrap();
+        assert_eq!(*ttl_seconds, 300);
+    }
 
     #[test]
     fn glob_match_literal_wildcard_and_anchors() {
@@ -953,6 +1000,8 @@ mod tests {
         ServerConfig::Http {
             url: "https://example.com/mcp".into(),
             oauth: Some(oauth),
+            credential_provider: None,
+            bearer_token: None,
             tool_filter: None,
             request_timeout_secs: default_request_timeout_secs(),
             log_level: None,
