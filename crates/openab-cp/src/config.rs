@@ -72,6 +72,12 @@ pub struct CpConfig {
     #[serde(default = "default_max_connections_per_identity")]
     pub max_connections_per_identity: u32,
 
+    /// Maximum size of prompt/result excerpts mirrored to observers in
+    /// `cp/event` frames. The lobby is an audit surface, not a second
+    /// delivery path: excerpts are truncated with a marker, never rejected.
+    #[serde(default = "default_max_event_excerpt_bytes")]
+    pub max_event_excerpt_bytes: usize,
+
     /// Identity table: auth key → immutable claims.
     /// Keyed by the key id (`kid`), with the secret alongside, so logs can
     /// reference identities without printing secrets.
@@ -109,6 +115,9 @@ fn default_register_timeout_secs() -> u64 {
 }
 fn default_max_connections_per_identity() -> u32 {
     8
+}
+fn default_max_event_excerpt_bytes() -> usize {
+    4 * 1024
 }
 
 /// Immutable identity claims bound to one auth key.

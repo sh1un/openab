@@ -40,6 +40,10 @@ register_timeout_secs = 10
 # on concurrent replicas of one logical agent.
 max_connections_per_identity = 8
 
+# Prompt/result excerpts mirrored to observers in cp/event frames are
+# truncated to this size (the lobby is an audit surface, not a payload path).
+max_event_excerpt_bytes = 4096
+
 [[agents]]
 key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
 namespace = "prod"
@@ -52,6 +56,15 @@ namespace = "prod"
 name = "worker-1"
 type = "worker"
 max_delegated_sessions_cap = 4   # CP-side clamp on advertised capacity
+
+# Read-only lobby client (e.g. the macOS/iOS lobby app). Observers receive
+# cp/event notifications and may call cp/list_agents; they can never
+# initiate, serve, or cancel delegations — no config can relax this.
+[[agents]]
+key = "${CP_KEY_LOBBY}"
+namespace = "prod"
+name = "lobby-app"
+type = "observer"
 
 # Per-namespace policy. Absent namespaces use the conservative defaults:
 # max_depth = 1, allow_worker_initiation = false.
