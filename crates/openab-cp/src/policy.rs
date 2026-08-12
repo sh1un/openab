@@ -34,11 +34,18 @@ pub enum PolicyDenial {
     WorkerInitiation,
     /// Observers are read-only: no config can relax this.
     ObserverInitiation,
-    DepthExceeded { max: u32, would_be: u32 },
-    Cycle { target: String },
+    DepthExceeded {
+        max: u32,
+        would_be: u32,
+    },
+    Cycle {
+        target: String,
+    },
     CrossNamespace,
     DeadlinePast,
-    DeadlineTooLong { max_secs: u64 },
+    DeadlineTooLong {
+        max_secs: u64,
+    },
     DeadlineExceedsParent,
 }
 
@@ -49,7 +56,10 @@ impl std::fmt::Display for PolicyDenial {
                 write!(f, "workers may not initiate delegations in this namespace")
             }
             PolicyDenial::ObserverInitiation => {
-                write!(f, "observers are read-only and may never initiate delegations")
+                write!(
+                    f,
+                    "observers are read-only and may never initiate delegations"
+                )
             }
             PolicyDenial::DepthExceeded { max, would_be } => write!(
                 f,
@@ -168,6 +178,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 2,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         assert!(check(&input, &relaxed).is_ok());
     }
@@ -186,6 +197,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 99,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         assert_eq!(
             check(&input, &relaxed),
@@ -208,6 +220,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 2,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         assert!(check(&input, &relaxed).is_ok());
     }
@@ -219,6 +232,7 @@ mod tests {
         let relaxed = NamespacePolicy {
             max_depth: 5,
             allow_worker_initiation: true,
+            metadata_only: false,
         };
         let input = base(now, &chain);
         assert!(matches!(

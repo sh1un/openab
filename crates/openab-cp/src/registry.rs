@@ -248,6 +248,7 @@ impl Registry {
         self.inner
             .read()
             .values()
+            .map(|e| &e.inst)
             .filter(|i| i.agent_type == AgentType::Observer && i.namespace == namespace)
             .cloned()
             .collect()
