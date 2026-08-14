@@ -19,10 +19,20 @@ ARG BUILDER_IMAGE=local_builder
 # and lets BuildKit prune every agent-specific build step for this target.
 FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS identity_issuer_builder
 WORKDIR /build
-COPY Cargo.lock ./Cargo.lock
-COPY crates/openab-identity-issuer/Cargo.toml ./Cargo.toml
-COPY crates/openab-identity-issuer/src/ ./src/
-RUN cargo build --release --locked
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-context/Cargo.toml crates/openab-context/Cargo.toml
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+COPY crates/openab-identity-issuer/Cargo.toml crates/openab-identity-issuer/Cargo.toml
+COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
+RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-context/src/lib.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && echo '' > crates/openab-mcp/src/lib.rs
+COPY crates/openab-identity-issuer/src/ crates/openab-identity-issuer/src/
+RUN cargo build --release --locked -p openab-identity-issuer
 
 # =============================================================================
 # Stage: local_builder — compile openab binary (unified mode)
