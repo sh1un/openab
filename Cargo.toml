@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/openab-context", "crates/openab-core", "crates/openab-gateway", "crates/openab-mcp"]
+members = [
+    "crates/openab-context",
+    "crates/openab-core",
+    "crates/openab-gateway",
+    "crates/openab-identity-issuer",
+    "crates/openab-mcp",
+]
 exclude = ["openab-agent", "crates/platform-schema"]
 
 [package]

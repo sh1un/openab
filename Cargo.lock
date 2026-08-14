@@ -2617,6 +2617,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openab-identity-issuer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "openab-mcp"
 version = "0.1.0"
 dependencies = [
