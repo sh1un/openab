@@ -3,6 +3,7 @@ members = [
     "crates/openab-context",
     "crates/openab-core",
     "crates/openab-gateway",
+    "crates/openab-github-mcp-broker",
     "crates/openab-identity-issuer",
     "crates/openab-mcp",
 ]

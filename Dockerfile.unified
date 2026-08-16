@@ -34,6 +34,15 @@ RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-
 COPY crates/openab-identity-issuer/src/ crates/openab-identity-issuer/src/
 RUN cargo build --release --locked -p openab-identity-issuer
 
+# The delegated GitHub broker is a separate trust boundary: Human GitHub
+# credentials live only in this image/service, never in an agent image.
+FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS github_mcp_broker_builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+RUN cargo build --release --locked -p openab-github-mcp-broker
+
 # =============================================================================
 # Stage: local_builder — compile openab binary (unified mode)
 # Only executed during build-core or local dev. When BUILDER_IMAGE is overridden
@@ -104,6 +113,23 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
 ENTRYPOINT ["tini", "--"]
 CMD ["openab-identity-issuer"]
+
+# =============================================================================
+# Target: github-mcp-broker — Human-scoped credential injection boundary
+# =============================================================================
+FROM debian:trixie-slim AS github-mcp-broker
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10002 --shell /usr/sbin/nologin broker
+COPY --from=github_mcp_broker_builder --chown=broker:broker /build/target/release/openab-github-mcp-broker /usr/local/bin/openab-github-mcp-broker
+ENV OPENAB_GITHUB_BROKER_LISTEN=0.0.0.0:8080
+EXPOSE 8080
+USER broker
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:8080/healthz" >/dev/null || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab-github-mcp-broker"]
 
 # =============================================================================
 # Stage: base-debian — shared runtime base for debian-based agents

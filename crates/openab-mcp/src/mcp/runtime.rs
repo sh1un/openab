@@ -513,6 +513,37 @@ impl McpRuntimeManager {
         Self::from_config_with_auth_path(cfg, auth_path())
     }
 
+    /// Build an isolated runtime for one request-scoped HTTP bearer.
+    ///
+    /// This is intentionally a constructor rather than a serializable config
+    /// field: the bearer must never enter `mcp.json`, `auth.json`, or an agent
+    /// subprocess environment. Callers should drop the returned manager after
+    /// the request and explicitly disconnect it when practical.
+    pub fn for_request_bearer(
+        name: impl Into<String>,
+        url: impl Into<String>,
+        bearer: impl Into<String>,
+        request_timeout_secs: u64,
+    ) -> Self {
+        let name = name.into();
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert(
+            name,
+            ServerConfig::Http {
+                url: url.into(),
+                oauth: None,
+                credential_provider: None,
+                bearer_token: Some(bearer.into()),
+                tool_filter: None,
+                request_timeout_secs,
+                log_level: None,
+                ping_interval_secs: None,
+                ping_timeout_secs: None,
+            },
+        );
+        Self::from_config(cfg)
+    }
+
     pub fn from_config_with_auth_path(cfg: McpConfig, auth_path: PathBuf) -> Self {
         let mut catalog: Vec<CatalogEntry> = cfg
             .servers
