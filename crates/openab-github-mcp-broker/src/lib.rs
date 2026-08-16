@@ -29,6 +29,7 @@ const DEFAULT_GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 #[derive(Clone)]
 pub struct Config {
     pub listen: String,
+    pub allowed_hosts: Vec<String>,
     pub upstream_url: String,
     pub issuer: String,
     pub audience: String,
@@ -67,9 +68,17 @@ impl Config {
             "request timeout must be between 1 and 300 seconds"
         );
 
+        let allowed_hosts = broker_allowed_hosts(
+            std::env::var("OPENAB_GITHUB_BROKER_ALLOWED_HOSTS")
+                .ok()
+                .as_deref(),
+            std::env::var("CONTAINER_HOSTNAME").ok().as_deref(),
+        )?;
+
         Ok(Self {
             listen: std::env::var("OPENAB_GITHUB_BROKER_LISTEN")
                 .unwrap_or_else(|_| "0.0.0.0:8080".into()),
+            allowed_hosts,
             upstream_url: std::env::var("OPENAB_GITHUB_MCP_URL")
                 .unwrap_or_else(|_| DEFAULT_GITHUB_MCP_URL.into()),
             issuer: required_env("OPENAB_GITHUB_BROKER_IDENTITY_ISSUER")?,
@@ -87,6 +96,31 @@ impl Config {
             self.audience.clone(),
         )
     }
+}
+
+fn broker_allowed_hosts(
+    explicit: Option<&str>,
+    container_hostname: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut hosts = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    for raw in explicit.into_iter().chain(container_hostname) {
+        for host in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        {
+            anyhow::ensure!(
+                !host.contains("://")
+                    && !host.contains('/')
+                    && !host.chars().any(char::is_whitespace),
+                "broker allowed host must be a hostname or host:port authority"
+            );
+            if !hosts.iter().any(|existing| existing == host) {
+                hosts.push(host.to_owned());
+            }
+        }
+    }
+    Ok(hosts)
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -256,13 +290,15 @@ impl ServerHandler for GithubBroker {
 
 pub fn router(config: Config) -> Result<axum::Router> {
     use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpService,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
     let broker = GithubBroker::new(&config)?;
+    let server_config =
+        StreamableHttpServerConfig::default().with_allowed_hosts(config.allowed_hosts.clone());
     let service = StreamableHttpService::new(
         move || Ok(broker.clone()),
         LocalSessionManager::default().into(),
-        Default::default(),
+        server_config,
     );
     Ok(axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
@@ -291,6 +327,7 @@ KnypscJHThLt6CU5VS/ZpEpCrh8CcS99GW7BwYkKslVse7EMGIvfS70CoBtuTt65
     fn broker() -> GithubBroker {
         let config = Config {
             listen: "127.0.0.1:0".into(),
+            allowed_hosts: vec!["localhost".into()],
             upstream_url: "https://example.invalid/mcp".into(),
             issuer: "https://issuer.example".into(),
             audience: "openab-github-broker".into(),
@@ -364,6 +401,25 @@ KnypscJHThLt6CU5VS/ZpEpCrh8CcS99GW7BwYkKslVse7EMGIvfS70CoBtuTt65
         assert_eq!(shiun_token, "github-user-token-a");
         assert_eq!(hr_token, "github-user-token-b");
         assert_ne!(shiun_token, hr_token);
+    }
+
+    #[test]
+    fn allowed_hosts_include_loopback_container_and_explicit_authorities() {
+        let hosts = broker_allowed_hosts(
+            Some("broker.example.com, broker.example.com:8443"),
+            Some("openab-github-mcp-broker.zeabur.internal"),
+        )
+        .unwrap();
+        assert!(hosts.contains(&"localhost".to_owned()));
+        assert!(hosts.contains(&"openab-github-mcp-broker.zeabur.internal".to_owned()));
+        assert!(hosts.contains(&"broker.example.com".to_owned()));
+        assert!(hosts.contains(&"broker.example.com:8443".to_owned()));
+    }
+
+    #[test]
+    fn allowed_hosts_reject_urls_and_paths() {
+        assert!(broker_allowed_hosts(Some("https://broker.example.com"), None).is_err());
+        assert!(broker_allowed_hosts(Some("broker.example.com/mcp"), None).is_err());
     }
 
     #[test]

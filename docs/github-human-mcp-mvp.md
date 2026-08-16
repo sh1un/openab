@@ -29,6 +29,12 @@ OPENAB_GITHUB_MCP_URL=https://api.githubcopilot.com/mcp/
 OPENAB_GITHUB_BROKER_CONNECTIONS_JSON={"employee-sh1un":"<SH1UN_GITHUB_TOKEN>","employee-hr":"<HR_GITHUB_TOKEN>"}
 ```
 
+The broker keeps rmcp's DNS-rebinding protection enabled. It automatically
+adds the platform-provided `CONTAINER_HOSTNAME` to the loopback allowlist. For
+other deployment hostnames, add comma-separated hostname or `host:port`
+authorities with `OPENAB_GITHUB_BROKER_ALLOWED_HOSTS`; do not include a URL
+scheme or path.
+
 The connection map is an MVP-only manual substitute for `/connect github`.
 Use Human credentials with the minimum repository permissions necessary. Never
 put this map on `openab-codex`; it belongs only on the broker service.
