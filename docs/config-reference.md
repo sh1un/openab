@@ -111,6 +111,23 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 
 ---
 
+## `[agentcore_identity_callback]`
+
+Optional public callback listener for AgentCore Identity user-federated OAuth.
+It is available only in builds containing the `agentcore-identity` feature.
+The listener normally receives plain HTTP behind a TLS-terminating Zeabur or
+Kubernetes ingress; the externally registered callback URL must use HTTPS.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `listen` | string | `"0.0.0.0:8080"` | Container bind address. The callback route is `/oauth/agentcore/callback`; health is `/healthz`. |
+
+The callback never trusts browser arrival as Human identity. It displays a
+short-lived confirmation code that must be submitted through the originating
+authenticated chat identity. See [AgentCore Identity Credential Backend](agentcore-identity.md).
+
+---
+
 ## `[identity]` (PoC)
 
 Optional end-user identity propagation for contextual downstream authorization.

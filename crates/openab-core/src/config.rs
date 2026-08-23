@@ -121,6 +121,21 @@ pub struct McpFacadeConfig {
     pub tunnel_timeout_seconds: u64,
 }
 
+/// Public HTTPS callback listener (normally behind a TLS-terminating ingress)
+/// used by the optional AgentCore Identity user-federation flow. The handler
+/// does not bind identity by itself; it emits a one-time code that must be
+/// confirmed from the originating authenticated chat turn.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCoreIdentityCallbackConfig {
+    #[serde(default = "default_agentcore_identity_callback_listen")]
+    pub listen: String,
+}
+
+fn default_agentcore_identity_callback_listen() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
 /// Public so the binary can use the same value instead of repeating the literal. A private
 /// default plus an `unwrap_or(180)` at the call site is two records of one fact, and the one in
 /// the binary would silently keep the old number the day this changes.
@@ -248,6 +263,9 @@ pub struct Config {
     /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
     /// the opt-in signal: absent = no facade, no listener, no new behavior.
     pub mcp: Option<McpFacadeConfig>,
+    /// Optional public callback for AgentCore Identity OAuth 3LO. Absent means
+    /// no public listener and no change for broker-only deployments.
+    pub agentcore_identity_callback: Option<AgentCoreIdentityCallbackConfig>,
     /// Optional end-user identity propagation. Absent preserves the previous
     /// behavior: no request identity is resolved or sent downstream.
     pub identity: Option<IdentityPropagationConfig>,
@@ -2559,6 +2577,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn agentcore_identity_callback_is_opt_in_with_safe_container_default() {
+        let absent = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(absent.agentcore_identity_callback.is_none());
+
+        let configured = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[agentcore_identity_callback]\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .agentcore_identity_callback
+                .expect("section enables callback")
+                .listen,
+            "0.0.0.0:8080"
+        );
     }
     use std::io::Write;
 

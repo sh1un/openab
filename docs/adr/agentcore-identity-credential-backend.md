@@ -54,14 +54,18 @@ The provider performs this data path:
 2. `GetResourceOauth2Token` using that workload token, a configured resource
    credential provider, and an explicit OAuth scope list.
 3. If an access token is returned, inject it as the downstream MCP bearer token.
-4. If user consent is required, return a typed authorization challenge. Never
-   log or return the workload token or provider access token.
+4. If user consent is required, expose synthetic `connect_<name>` and
+   `complete_<name>` capabilities. Never log or return the workload token or
+   provider access token.
 
-User-federated OAuth is not complete until a public HTTPS callback verifies the
-currently signed-in application user and calls `CompleteResourceTokenAuth` with
-the same user ID and AgentCore session URI. OpenAB must fail closed while that
-binding is incomplete. The callback is a separate trust boundary and is not
-implicitly hosted by the loopback-only MCP Facade.
+Slack has no browser session that an HTTPS callback can independently inspect.
+Therefore the callback does not complete the AWS session. It marks the returned
+session and displays a one-time code; the Human submits that code through the
+same authenticated Slack conversation. The Facade compares the live trusted
+subject with the initiating subject and only then calls
+`CompleteResourceTokenAuth` with the same user ID and AgentCore session URI.
+OpenAB fails closed while that binding is incomplete. The public callback is a
+separate listener from the loopback-only MCP Facade.
 
 ## Security invariants
 
@@ -73,7 +77,9 @@ implicitly hosted by the loopback-only MCP Facade.
 - Workload and provider tokens are not persisted by OpenAB.
 - OAuth scopes are deployment configuration, not model-controlled input.
 - Authorization URLs may be shown only to the human who initiated the request;
-  the callback must independently bind browser session and initiating identity.
+  a forwarded URL cannot be completed by a different Slack identity.
+- Confirmation codes are short-lived, single-use, scoped to one connection and
+  initiating subject, and are not downstream provider credentials.
 - Custom brokers remain a supported vendor-neutral alternative.
 
 ## Consequences
@@ -83,8 +89,9 @@ implicitly hosted by the loopback-only MCP Facade.
 - Each configured MCP server can independently choose its credential strategy.
 - The AWS feature adds SigV4 and AWS configuration dependencies only to builds
   that enable it.
-- Production user federation needs a separately authenticated callback surface;
-  a raw callback URL or unsigned Slack link is not sufficient identity proof.
+- Production user federation needs a public callback plus live confirmation
+  from the initiating authenticated chat identity; callback arrival alone is
+  not sufficient identity proof.
 - Initial implementation uses the user-ID exchange because OpenAB's adapter has
   already authenticated and normalized the source identity. Deployments that
   have an enterprise IdP should later prefer the JWT exchange API so AgentCore
@@ -106,4 +113,3 @@ part of the agent's blast radius.
 
 Rejected. Prompt injection could then select another user or broaden access.
 Those values come only from trusted request context and administrator config.
-

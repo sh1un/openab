@@ -483,12 +483,45 @@ impl McpConfig {
     /// Validate every server's `oauth` block (ADR §6.3 boot check). Returns
     /// the first failure — finer-grained per-server isolation lives in §5.6.
     pub fn validate(&self) -> Result<()> {
+        let mut connection_names = std::collections::HashSet::new();
         for (name, server) in &self.servers {
             if let ServerConfig::Http {
                 oauth: Some(oauth), ..
             } = server
             {
                 oauth.validate(name)?;
+            }
+            if let Some(provider) = server.credential_provider() {
+                if let CredentialProviderConfig::AgentcoreIdentity {
+                    region,
+                    workload_name,
+                    resource_credential_provider_name,
+                    resource_oauth2_return_url,
+                    connection_name,
+                    user_id_namespace,
+                    scopes,
+                } = provider
+                {
+                    super::credential::validate_agentcore_identity_config(
+                        region,
+                        workload_name,
+                        resource_credential_provider_name,
+                        resource_oauth2_return_url,
+                        connection_name.as_deref(),
+                        user_id_namespace,
+                        scopes,
+                    )?;
+                    let connection_name = super::credential::connection_name(provider, name)
+                        .context("derive agentcore_identity connection name")?;
+                    anyhow::ensure!(
+                        !connection_name.is_empty(),
+                        "mcp server {name:?}: agentcore_identity connection name is empty"
+                    );
+                    anyhow::ensure!(
+                        connection_names.insert(connection_name.clone()),
+                        "duplicate agentcore_identity connection_name {connection_name:?}"
+                    );
+                }
             }
         }
         Ok(())
@@ -620,6 +653,7 @@ mod tests {
                 "workload_name": "openab-codex",
                 "resource_credential_provider_name": "openab-github",
                 "resource_oauth2_return_url": "https://openab.example.com/oauth/agentcore/callback",
+                "connection_name": "github",
                 "scopes": ["read:user", "repo"]
             }
         }))
@@ -627,6 +661,7 @@ mod tests {
 
         let CredentialProviderConfig::AgentcoreIdentity {
             user_id_namespace,
+            connection_name,
             scopes,
             ..
         } = server.credential_provider().unwrap()
@@ -634,7 +669,40 @@ mod tests {
             panic!("expected AgentcoreIdentity credential provider");
         };
         assert_eq!(user_id_namespace, "openab");
+        assert_eq!(connection_name.as_deref(), Some("github"));
         assert_eq!(scopes, &["read:user", "repo"]);
+    }
+
+    #[test]
+    fn rejects_duplicate_agentcore_identity_connection_names() {
+        let server = |provider: &str| ServerConfig::Http {
+            url: format!("https://{provider}.example/mcp"),
+            oauth: None,
+            credential_provider: Some(Box::new(CredentialProviderConfig::AgentcoreIdentity {
+                region: "ap-southeast-1".into(),
+                workload_name: "openab-codex".into(),
+                resource_credential_provider_name: provider.into(),
+                resource_oauth2_return_url: "https://openab.example.com/oauth/agentcore/callback"
+                    .into(),
+                connection_name: Some("github".into()),
+                user_id_namespace: "openab-slack".into(),
+                scopes: vec!["read:user".into()],
+            })),
+            bearer_token: None,
+            tool_filter: None,
+            request_timeout_secs: 60,
+            log_level: None,
+            ping_interval_secs: None,
+            ping_timeout_secs: None,
+        };
+        let mut config = McpConfig::default();
+        config
+            .servers
+            .insert("github-one".into(), server("provider-one"));
+        config
+            .servers
+            .insert("github-two".into(), server("provider-two"));
+        assert!(config.validate().is_err());
     }
 
     #[test]

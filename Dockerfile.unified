@@ -38,12 +38,12 @@ RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-
     && echo '' > crates/openab-core/src/lib.rs \
     && echo '' > crates/openab-gateway/src/lib.rs \
     && echo '' > crates/openab-mcp/src/lib.rs \
-    && cargo build --release --features unified \
+    && cargo build --release --features unified,agentcore-identity \
     && rm -rf src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
 COPY crates/ crates/
 COPY src/ src/
 RUN touch src/main.rs crates/openab-context/src/lib.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs \
-    && cargo build --release --features unified
+    && cargo build --release --features unified,agentcore-identity
 # Build openab-agent (used by native variant) — copied late to avoid cache busts
 COPY openab-agent/ openab-agent/
 RUN cd openab-agent && { grep -q '^\[workspace\]' Cargo.toml || printf '\n[workspace]\n' >> Cargo.toml; } && cargo build --release

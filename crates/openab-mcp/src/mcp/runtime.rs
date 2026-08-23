@@ -421,6 +421,7 @@ pub struct CatalogEntry {
     pub name: String,
     pub transport: &'static str,
     pub requires_oauth: bool,
+    pub credential_provider: Option<super::credential::CredentialProviderConfig>,
 }
 
 /// Owns one `ServerHandle` per configured server, behind an async `RwLock`
@@ -521,6 +522,7 @@ impl McpRuntimeManager {
                 name: name.clone(),
                 transport: config.transport_label(),
                 requires_oauth: config.requires_oauth(),
+                credential_provider: config.credential_provider().cloned(),
             })
             .collect();
         catalog.sort_by(|a, b| a.name.cmp(&b.name));

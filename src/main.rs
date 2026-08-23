@@ -535,6 +535,29 @@ async fn main() -> anyhow::Result<()> {
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
     openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+
+    if let Some(callback_cfg) = cfg.agentcore_identity_callback.clone() {
+        #[cfg(feature = "agentcore-identity")]
+        tokio::spawn(async move {
+            let listen = callback_cfg.listen;
+            if let Err(error) = openab_mcp::mcp::agentcore_identity::serve_callback(&listen).await {
+                tracing::error!(
+                    error = %format!("{error:#}"),
+                    listen,
+                    "AgentCore Identity callback exited"
+                );
+                std::process::exit(1);
+            }
+        });
+        #[cfg(not(feature = "agentcore-identity"))]
+        {
+            let _ = callback_cfg;
+            anyhow::bail!(
+                "[agentcore_identity_callback] requires a build with the agentcore-identity feature"
+            );
+        }
+    }
+
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();

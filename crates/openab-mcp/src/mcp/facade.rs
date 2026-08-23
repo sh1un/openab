@@ -126,6 +126,11 @@ fn matches_query(name: &str, description: Option<&str>, query: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn is_identity_action_name(name: &str) -> bool {
+    let leaf = name.rsplit(':').next().unwrap_or(name);
+    leaf.starts_with("connect_") || leaf.starts_with("complete_")
+}
+
 /// Publish names for a `(server, tool)` set: bare tool name normally,
 /// `server:tool` for every occurrence of a tool name that appears on more
 /// than one server (deterministic — no first-wins shadowing).
@@ -216,7 +221,15 @@ impl McpFacade {
         ctx: Option<&SessionCtx>,
     ) -> Result<Value> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let (capabilities, unavailable) = collect_capabilities(&self.manager, ctx).await;
+        // A connect/complete lookup targets the in-process identity source.
+        // Do not contact the downstream server first: an unconnected
+        // AgentCore provider would create an orphan authorization session
+        // before the explicit `connect_*` call creates the real one.
+        let (capabilities, unavailable) = if is_identity_action_name(query) {
+            (Vec::new(), Vec::new())
+        } else {
+            collect_capabilities(&self.manager, ctx).await
+        };
         let mut entries: Vec<Value> = capabilities
             .iter()
             .filter(|c| matches_query(&c.name, c.tool.description.as_deref(), query))
@@ -278,6 +291,25 @@ impl McpFacade {
             .and_then(|v| v.as_str())
             .context("execute_capability requires a `name` string")?;
         let arguments = args.get("arguments").cloned().unwrap_or(Value::Null);
+        // AgentCore connect/complete actions are local trust-boundary tools.
+        // Resolve them before downstream discovery so executing `connect_*`
+        // does not create an unrelated OAuth session as a side effect.
+        if is_identity_action_name(name) {
+            for source in self
+                .visible_sources(ctx)
+                .into_iter()
+                .filter(|source| source.provider() == "agentcore_identity")
+            {
+                for tool in source.tools(ctx) {
+                    let published = format!("{}:{}", source.provider(), tool.name);
+                    if tool.name.as_ref() == name || published == name {
+                        return self
+                            .dispatch_source(source, &tool, name, &arguments, ctx)
+                            .await;
+                    }
+                }
+            }
+        }
         // Exact-name contract (ADR §6.4): resolve against the discovered
         // catalog first. Ordering matters and must mirror discovery's
         // publish rule — downstream servers win bare names, so a source
@@ -298,58 +330,62 @@ impl McpFacade {
                 if tool.name.as_ref() != name && published != name {
                     continue;
                 }
-                let args_map = match &arguments {
-                    Value::Object(map) => map.clone(),
-                    Value::Null => Map::new(),
-                    other => {
-                        anyhow::bail!(
-                            "capability arguments must be a JSON object (or omitted), got {other}"
-                        );
-                    }
-                };
-                // Same pre-flight the meta-tool applies to downstream calls:
-                // schema-invalid arguments are refused with the precise
-                // reason, never forwarded.
-                meta_tool::validate_args(tool.input_schema.as_ref(), &args_map)
-                    .with_context(|| format!("execute_capability {name:?}"))?;
-                // Redacted for the same reason the arguments below are hashed, and the
-                // inconsistency was the tell: this line hashed the args because they "could carry
-                // secrets" while printing a resume credential beside them in cleartext. An ACP
-                // `channel_id` is `acp_<uuid>` and the session id is `sess_<same uuid>`.
-                let channel = redact_channel(ctx.map(|c| c.channel_id.as_str()).unwrap_or("-"));
-                // Same audit shape as the meta_tool dispatcher: hash of the
-                // wire arguments, never plaintext (could carry secrets).
-                let args_sha256 = {
-                    use sha2::{Digest as _, Sha256};
-                    Sha256::digest(serde_json::to_vec(&args_map).unwrap_or_default())
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                };
-                tracing::info!(
-                    target: "mcp.audit",
-                    provider = source.provider(),
-                    tool = %tool.name,
-                    channel,
-                    args_sha256 = %args_sha256,
-                    "facade source call"
-                );
-                let (value, is_error) = source.call(ctx, tool.name.as_ref(), &args_map).await?;
-                tracing::info!(
-                    target: "mcp.audit",
-                    provider = source.provider(),
-                    tool = %tool.name,
-                    channel,
-                    args_sha256 = %args_sha256,
-                    is_error,
-                    "facade source call exit"
-                );
-                return Ok((value, is_error));
+                return self
+                    .dispatch_source(source, &tool, name, &arguments, ctx)
+                    .await;
             }
         }
         anyhow::bail!(
             "unknown capability {name:?} — call search_capabilities and use an exact returned name"
         );
+    }
+
+    async fn dispatch_source(
+        &self,
+        source: &Arc<dyn CapabilitySource>,
+        tool: &Tool,
+        published_name: &str,
+        arguments: &Value,
+        ctx: Option<&SessionCtx>,
+    ) -> Result<(Value, bool)> {
+        let args_map = match arguments {
+            Value::Object(map) => map.clone(),
+            Value::Null => Map::new(),
+            other => {
+                anyhow::bail!(
+                    "capability arguments must be a JSON object (or omitted), got {other}"
+                );
+            }
+        };
+        meta_tool::validate_args(tool.input_schema.as_ref(), &args_map)
+            .with_context(|| format!("execute_capability {published_name:?}"))?;
+        let channel = redact_channel(ctx.map(|c| c.channel_id.as_str()).unwrap_or("-"));
+        let args_sha256 = {
+            use sha2::{Digest as _, Sha256};
+            Sha256::digest(serde_json::to_vec(&args_map).unwrap_or_default())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        tracing::info!(
+            target: "mcp.audit",
+            provider = source.provider(),
+            tool = %tool.name,
+            channel,
+            args_sha256 = %args_sha256,
+            "facade source call"
+        );
+        let (value, is_error) = source.call(ctx, tool.name.as_ref(), &args_map).await?;
+        tracing::info!(
+            target: "mcp.audit",
+            provider = source.provider(),
+            tool = %tool.name,
+            channel,
+            args_sha256 = %args_sha256,
+            is_error,
+            "facade source call exit"
+        );
+        Ok((value, is_error))
     }
 
     async fn dispatch_downstream(
@@ -547,6 +583,16 @@ pub(crate) fn build_router(
 ) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpService,
+    };
+    #[cfg(feature = "agentcore-identity")]
+    let sources = {
+        let mut sources = sources;
+        if let Some(source) =
+            super::agentcore_identity::AgentCoreIdentitySource::from_manager(&manager)
+        {
+            sources.push(Arc::new(source));
+        }
+        sources
     };
     let sources = Arc::new(sources);
     let service = StreamableHttpService::new(
