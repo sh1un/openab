@@ -60,11 +60,16 @@ layer at `.openab/agent/mcp.json`):
         "scopes": ["gateway:invoke"],
         "ttl_seconds": 300
       },
-      "tool_filter": { "include": ["read_source"] }
+      "tool_filter": { "include": ["SourceTarget___read_source"] }
     }
   }
 }
 ```
+
+AgentCore Gateway exposes tools as `${target_name}___${tool_name}`. The example
+assumes a Gateway target named `SourceTarget`; the OpenAB `tool_filter` must
+match that externally visible name. Searching the Facade for `read_source`
+still finds the prefixed capability.
 
 Inject an RSA private key through `OPENAB_IDENTITY_SIGNING_KEY`; do not put it
 in either config file. Configure the Gateway `CUSTOM_JWT` authorizer with the
@@ -153,6 +158,9 @@ The PoC adds coverage for:
   an HR directory.
 - The RS256 provider assumes an operator-managed issuer, discovery document,
   and JWKS. OpenAB does not host an OIDC issuer.
+- The optional `openab-identity-issuer` companion is a verification-only
+  discovery/JWKS service for this PoC. It never receives the RSA private key
+  and does not implement login or token issuance.
 - The contextual downstream MCP connection is intentionally ephemeral so a
   bearer or Gateway MCP session is never reused for another human. This adds a
   handshake per discovery/execution request.

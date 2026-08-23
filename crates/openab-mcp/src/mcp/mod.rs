@@ -19,6 +19,34 @@ use config::{McpConfig, ServerConfig};
 
 pub use runtime::McpRuntimeManager;
 
+/// Discover the exact tools published by one configured downstream server.
+/// Used by authenticated MCP proxies that reuse OpenAB's transport, timeout,
+/// schema, and redaction behavior without exposing the agent-facing meta-tool.
+pub async fn discover_server_tools(
+    manager: &McpRuntimeManager,
+    server: &str,
+) -> anyhow::Result<Vec<rmcp::model::Tool>> {
+    meta_tool::fetch_tools(manager, server).await
+}
+
+/// Invoke one exact downstream tool through OpenAB's normal enforcement path.
+pub async fn invoke_server_tool(
+    manager: &McpRuntimeManager,
+    server: impl Into<String>,
+    tool: impl Into<String>,
+    arguments: serde_json::Value,
+) -> anyhow::Result<(serde_json::Value, Option<bool>)> {
+    meta_tool::dispatch(
+        manager,
+        meta_tool::Action::Call {
+            server: server.into(),
+            tool: tool.into(),
+            arguments,
+        },
+    )
+    .await
+}
+
 /// Secret-key tokens (lowercased) whose following value [`redact_secrets`]
 /// masks. Conservative, always-on built-in set — the env/`redact.toml`
 /// configurable variant from the spec note (Section 17 §4) is deferred as

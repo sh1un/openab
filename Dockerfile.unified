@@ -14,6 +14,35 @@
 # Global ARG — must be declared before first FROM for use in FROM instructions
 ARG BUILDER_IMAGE=local_builder
 
+# The issuer is intentionally built in its own small stage. This keeps the
+# verification-only companion independent from the much larger agent builder
+# and lets BuildKit prune every agent-specific build step for this target.
+FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS identity_issuer_builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-context/Cargo.toml crates/openab-context/Cargo.toml
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+COPY crates/openab-identity-issuer/Cargo.toml crates/openab-identity-issuer/Cargo.toml
+COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
+RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-context/src/lib.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && echo '' > crates/openab-mcp/src/lib.rs
+COPY crates/openab-identity-issuer/src/ crates/openab-identity-issuer/src/
+RUN cargo build --release --locked -p openab-identity-issuer
+
+# The delegated GitHub broker is a separate trust boundary: Human GitHub
+# credentials live only in this image/service, never in an agent image.
+FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS github_mcp_broker_builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY src/ src/
+RUN cargo build --release --locked -p openab-github-mcp-broker
+
 # =============================================================================
 # Stage: local_builder — compile openab binary (unified mode)
 # Only executed during build-core or local dev. When BUILDER_IMAGE is overridden
@@ -31,19 +60,24 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-context/Cargo.toml crates/openab-context/Cargo.toml
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+COPY crates/openab-identity-issuer/Cargo.toml crates/openab-identity-issuer/Cargo.toml
 COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
-RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src \
+RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-identity-issuer/src crates/openab-mcp/src \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > crates/openab-context/src/lib.rs \
     && echo '' > crates/openab-core/src/lib.rs \
     && echo '' > crates/openab-gateway/src/lib.rs \
+    && echo '' > crates/openab-identity-issuer/src/lib.rs \
+    && echo 'fn main() {}' > crates/openab-identity-issuer/src/main.rs \
     && echo '' > crates/openab-mcp/src/lib.rs \
     && cargo build --release --features unified \
-    && rm -rf src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
+    && cargo build --release -p openab-identity-issuer \
+    && rm -rf src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-identity-issuer/src crates/openab-mcp/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs crates/openab-context/src/lib.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs \
-    && cargo build --release --features unified
+RUN touch src/main.rs crates/openab-context/src/lib.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-identity-issuer/src/lib.rs crates/openab-identity-issuer/src/main.rs crates/openab-mcp/src/lib.rs \
+    && cargo build --release --features unified \
+    && cargo build --release -p openab-identity-issuer
 # Build openab-agent (used by native variant) — copied late to avoid cache busts
 COPY openab-agent/ openab-agent/
 RUN cd openab-agent && { grep -q '^\[workspace\]' Cargo.toml || printf '\n[workspace]\n' >> Cargo.toml; } && cargo build --release
@@ -62,6 +96,40 @@ RUN for bin in /build/target/release/openab \
               /build/agy-acp/target/release/agy-acp; do \
       test -x "$bin" || { echo "ERROR: missing binary: $bin" >&2; exit 1; }; \
     done
+
+# =============================================================================
+# Target: identity-issuer — public discovery/JWKS companion (no private key)
+# =============================================================================
+FROM debian:trixie-slim AS identity-issuer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin issuer
+COPY --from=identity_issuer_builder --chown=issuer:issuer /build/target/release/openab-identity-issuer /usr/local/bin/openab-identity-issuer
+ENV PORT=8080
+EXPOSE 8080
+USER issuer
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab-identity-issuer"]
+
+# =============================================================================
+# Target: github-mcp-broker — Human-scoped credential injection boundary
+# =============================================================================
+FROM debian:trixie-slim AS github-mcp-broker
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10002 --shell /usr/sbin/nologin broker
+COPY --from=github_mcp_broker_builder --chown=broker:broker /build/target/release/openab-github-mcp-broker /usr/local/bin/openab-github-mcp-broker
+ENV OPENAB_GITHUB_BROKER_LISTEN=0.0.0.0:8080
+EXPOSE 8080
+USER broker
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:8080/healthz" >/dev/null || exit 1
+ENTRYPOINT ["tini", "--"]
+CMD ["openab-github-mcp-broker"]
 
 # =============================================================================
 # Stage: base-debian — shared runtime base for debian-based agents
