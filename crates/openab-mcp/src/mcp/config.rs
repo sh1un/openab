@@ -602,8 +602,39 @@ mod tests {
         .unwrap();
 
         let CredentialProviderConfig::AgentcoreGateway { ttl_seconds, .. } =
-            server.credential_provider().unwrap();
+            server.credential_provider().unwrap()
+        else {
+            panic!("expected AgentcoreGateway credential provider");
+        };
         assert_eq!(*ttl_seconds, 300);
+    }
+
+    #[test]
+    fn parses_opt_in_agentcore_identity_credential_provider() {
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": "https://github-mcp.example/mcp",
+            "credential_provider": {
+                "type": "agentcore_identity",
+                "region": "ap-southeast-1",
+                "workload_name": "openab-codex",
+                "resource_credential_provider_name": "openab-github",
+                "resource_oauth2_return_url": "https://openab.example.com/oauth/agentcore/callback",
+                "scopes": ["read:user", "repo"]
+            }
+        }))
+        .unwrap();
+
+        let CredentialProviderConfig::AgentcoreIdentity {
+            user_id_namespace,
+            scopes,
+            ..
+        } = server.credential_provider().unwrap()
+        else {
+            panic!("expected AgentcoreIdentity credential provider");
+        };
+        assert_eq!(user_id_namespace, "openab");
+        assert_eq!(scopes, &["read:user", "repo"]);
     }
 
     #[test]

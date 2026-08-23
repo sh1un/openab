@@ -2,6 +2,7 @@
 //! lives here, outside Slack, ACP, sessions, and identity resolution.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
@@ -19,14 +20,37 @@ pub enum CredentialProviderConfig {
         #[serde(default = "default_credential_ttl_seconds")]
         ttl_seconds: u64,
     },
+    AgentcoreIdentity {
+        region: String,
+        workload_name: String,
+        resource_credential_provider_name: String,
+        resource_oauth2_return_url: String,
+        #[serde(default = "default_user_id_namespace")]
+        user_id_namespace: String,
+        scopes: Vec<String>,
+    },
 }
 
 fn default_credential_ttl_seconds() -> u64 {
     300
 }
 
+fn default_user_id_namespace() -> String {
+    "openab".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialOutcome {
+    Bearer(String),
+    AuthorizationRequired { authorization_url: String },
+}
+
+#[async_trait]
 pub trait CredentialProvider: Send + Sync {
-    fn credential(&self, context: &openab_context::ResolvedRequestContext) -> Result<String>;
+    async fn credential(
+        &self,
+        context: &openab_context::ResolvedRequestContext,
+    ) -> Result<CredentialOutcome>;
 }
 
 pub fn from_config(config: &CredentialProviderConfig) -> Result<Box<dyn CredentialProvider>> {
@@ -60,7 +84,89 @@ pub fn from_config(config: &CredentialProviderConfig) -> Result<Box<dyn Credenti
                 ttl_seconds: *ttl_seconds,
             }))
         }
+        CredentialProviderConfig::AgentcoreIdentity {
+            region,
+            workload_name,
+            resource_credential_provider_name,
+            resource_oauth2_return_url,
+            user_id_namespace,
+            scopes,
+        } => {
+            validate_agentcore_identity_config(
+                region,
+                workload_name,
+                resource_credential_provider_name,
+                resource_oauth2_return_url,
+                user_id_namespace,
+                scopes,
+            )?;
+            #[cfg(feature = "agentcore-identity")]
+            {
+                Ok(Box::new(AgentCoreIdentityCredentialProvider {
+                    region: region.clone(),
+                    workload_name: workload_name.clone(),
+                    resource_credential_provider_name: resource_credential_provider_name.clone(),
+                    resource_oauth2_return_url: resource_oauth2_return_url.clone(),
+                    user_id_namespace: user_id_namespace.clone(),
+                    scopes: scopes.clone(),
+                }))
+            }
+            #[cfg(not(feature = "agentcore-identity"))]
+            {
+                anyhow::bail!(
+                    "agentcore_identity credential provider requires the agentcore-identity build feature"
+                )
+            }
+        }
     }
+}
+
+fn validate_agentcore_identity_config(
+    region: &str,
+    workload_name: &str,
+    resource_credential_provider_name: &str,
+    resource_oauth2_return_url: &str,
+    user_id_namespace: &str,
+    scopes: &[String],
+) -> Result<()> {
+    anyhow::ensure!(
+        !region.is_empty()
+            && !region.starts_with('-')
+            && !region.ends_with('-')
+            && region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "agentcore_identity region must contain only lowercase ASCII letters, digits, and hyphens"
+    );
+    anyhow::ensure!(
+        (3..=255).contains(&workload_name.len())
+            && workload_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')),
+        "agentcore_identity workload_name must be 3-255 characters from [A-Za-z0-9_.-]"
+    );
+    anyhow::ensure!(
+        (1..=128).contains(&resource_credential_provider_name.len())
+            && resource_credential_provider_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "agentcore_identity resource_credential_provider_name must be 1-128 characters from [A-Za-z0-9_-]"
+    );
+    let return_url = url::Url::parse(resource_oauth2_return_url)
+        .context("parse agentcore_identity resource_oauth2_return_url")?;
+    anyhow::ensure!(
+        return_url.scheme() == "https",
+        "agentcore_identity resource_oauth2_return_url must use HTTPS"
+    );
+    anyhow::ensure!(
+        !user_id_namespace.trim().is_empty(),
+        "agentcore_identity user_id_namespace must be non-empty"
+    );
+    anyhow::ensure!(
+        !scopes.is_empty() && scopes.iter().all(|scope| !scope.trim().is_empty()),
+        "agentcore_identity scopes must contain at least one non-empty scope"
+    );
+    Ok(())
 }
 
 /// PoC adapter for AgentCore Gateway CUSTOM_JWT inbound authorization.
@@ -111,8 +217,12 @@ fn agentcore_claims<'a>(
     }
 }
 
+#[async_trait]
 impl CredentialProvider for AgentCoreGatewayCredentialProvider {
-    fn credential(&self, context: &openab_context::ResolvedRequestContext) -> Result<String> {
+    async fn credential(
+        &self,
+        context: &openab_context::ResolvedRequestContext,
+    ) -> Result<CredentialOutcome> {
         let pem = std::env::var(&self.private_key_env).with_context(|| {
             format!(
                 "credential private key env {} is not set",
@@ -128,7 +238,198 @@ impl CredentialProvider for AgentCoreGatewayCredentialProvider {
         let claims = agentcore_claims(self, context, now);
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(self.key_id.clone());
-        jsonwebtoken::encode(&header, &claims, &key).context("sign AgentCore request JWT")
+        let token =
+            jsonwebtoken::encode(&header, &claims, &key).context("sign AgentCore request JWT")?;
+        Ok(CredentialOutcome::Bearer(token))
+    }
+}
+
+#[cfg(any(feature = "agentcore-identity", test))]
+fn namespaced_user_id(namespace: &str, subject: &str) -> Result<String> {
+    anyhow::ensure!(
+        !subject.trim().is_empty(),
+        "trusted identity subject must be non-empty"
+    );
+    let user_id = format!("{}:{}", namespace.trim(), subject);
+    anyhow::ensure!(
+        (1..=128).contains(&user_id.len()),
+        "derived AgentCore Identity user ID exceeds 128 bytes"
+    );
+    Ok(user_id)
+}
+
+#[cfg(feature = "agentcore-identity")]
+struct AgentCoreIdentityCredentialProvider {
+    region: String,
+    workload_name: String,
+    resource_credential_provider_name: String,
+    resource_oauth2_return_url: String,
+    user_id_namespace: String,
+    scopes: Vec<String>,
+}
+
+#[cfg(feature = "agentcore-identity")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadTokenRequest<'a> {
+    user_id: &'a str,
+    workload_name: &'a str,
+}
+
+#[cfg(feature = "agentcore-identity")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkloadTokenResponse {
+    workload_access_token: String,
+}
+
+#[cfg(feature = "agentcore-identity")]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceTokenRequest<'a> {
+    workload_identity_token: &'a str,
+    resource_credential_provider_name: &'a str,
+    scopes: &'a [String],
+    oauth2_flow: &'static str,
+    resource_oauth2_return_url: &'a str,
+}
+
+#[cfg(feature = "agentcore-identity")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceTokenResponse {
+    access_token: Option<String>,
+    authorization_url: Option<String>,
+    session_status: Option<String>,
+}
+
+#[cfg(feature = "agentcore-identity")]
+fn resource_token_outcome(response: ResourceTokenResponse) -> Result<CredentialOutcome> {
+    anyhow::ensure!(
+        response.session_status.as_deref() != Some("FAILED"),
+        "AgentCore Identity authorization session failed"
+    );
+    if let Some(token) = response.access_token.filter(|value| !value.is_empty()) {
+        return Ok(CredentialOutcome::Bearer(token));
+    }
+    if let Some(url) = response.authorization_url.filter(|value| !value.is_empty()) {
+        let parsed = url::Url::parse(&url).context("parse AgentCore Identity authorization URL")?;
+        anyhow::ensure!(
+            parsed.scheme() == "https",
+            "AgentCore Identity authorization URL must use HTTPS"
+        );
+        return Ok(CredentialOutcome::AuthorizationRequired {
+            authorization_url: url,
+        });
+    }
+    anyhow::bail!(
+        "AgentCore Identity returned neither an access token nor an authorization URL (session status: {})",
+        response.session_status.as_deref().unwrap_or("unknown")
+    )
+}
+
+#[cfg(feature = "agentcore-identity")]
+async fn signed_post<T: Serialize, R: for<'de> Deserialize<'de>>(
+    region: &str,
+    path: &str,
+    request: &T,
+) -> Result<R> {
+    use aws_credential_types::provider::ProvideCredentials;
+    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+    use aws_sigv4::sign::v4;
+    use std::time::SystemTime;
+
+    let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_string()))
+        .load()
+        .await;
+    let credentials = sdk_config
+        .credentials_provider()
+        .context("no AWS credentials provider available for AgentCore Identity")?
+        .provide_credentials()
+        .await
+        .context("load AWS credentials for AgentCore Identity")?;
+    let identity = credentials.into();
+    let host = format!("bedrock-agentcore.{region}.amazonaws.com");
+    let url = format!("https://{host}{path}");
+    let body = serde_json::to_vec(request).context("serialize AgentCore Identity request")?;
+    let signing_params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name("bedrock-agentcore")
+        .time(SystemTime::now())
+        .settings(SigningSettings::default())
+        .build()
+        .context("build AgentCore Identity signing parameters")?;
+    let headers = [
+        ("host", host.as_str()),
+        ("content-type", "application/json"),
+    ];
+    let signable = SignableRequest::new(
+        "POST",
+        &url,
+        headers.into_iter(),
+        SignableBody::Bytes(&body),
+    )?;
+    let (instructions, _) = sign(signable, &signing_params.into())?.into_parts();
+
+    let client = reqwest::Client::new();
+    let mut builder = client
+        .post(&url)
+        .header("host", &host)
+        .header("content-type", "application/json")
+        .body(body);
+    for (name, value) in instructions.headers() {
+        builder = builder.header(name, value);
+    }
+    let response = builder
+        .send()
+        .await
+        .context("send AgentCore Identity request")?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("AgentCore Identity request failed with HTTP {status}");
+    }
+    response
+        .json::<R>()
+        .await
+        .context("decode AgentCore Identity response")
+}
+
+#[cfg(feature = "agentcore-identity")]
+#[async_trait]
+impl CredentialProvider for AgentCoreIdentityCredentialProvider {
+    async fn credential(
+        &self,
+        context: &openab_context::ResolvedRequestContext,
+    ) -> Result<CredentialOutcome> {
+        let user_id = namespaced_user_id(&self.user_id_namespace, &context.identity.subject)?;
+        let workload: WorkloadTokenResponse = signed_post(
+            &self.region,
+            "/identities/GetWorkloadAccessTokenForUserId",
+            &WorkloadTokenRequest {
+                user_id: &user_id,
+                workload_name: &self.workload_name,
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            !workload.workload_access_token.is_empty(),
+            "AgentCore Identity returned an empty workload access token"
+        );
+        let resource: ResourceTokenResponse = signed_post(
+            &self.region,
+            "/identities/oauth2/token",
+            &ResourceTokenRequest {
+                workload_identity_token: &workload.workload_access_token,
+                resource_credential_provider_name: &self.resource_credential_provider_name,
+                scopes: &self.scopes,
+                oauth2_flow: "USER_FEDERATION",
+                resource_oauth2_return_url: &self.resource_oauth2_return_url,
+            },
+        )
+        .await?;
+        resource_token_outcome(resource)
     }
 }
 
@@ -180,5 +481,87 @@ mod tests {
         assert_eq!(hr_claims["groups"], serde_json::json!(["hr"]));
         assert_eq!(cloud_claims["exp"], 400);
         assert_ne!(cloud_claims, hr_claims);
+    }
+
+    #[test]
+    fn agentcore_identity_user_ids_are_namespaced_and_subject_bound() {
+        assert_eq!(
+            namespaced_user_id("openab-slack", "employee-sh1un").unwrap(),
+            "openab-slack:employee-sh1un"
+        );
+        assert_ne!(
+            namespaced_user_id("openab-slack", "employee-sh1un").unwrap(),
+            namespaced_user_id("openab-slack", "employee-hr").unwrap()
+        );
+        assert!(namespaced_user_id("openab-slack", " ").is_err());
+    }
+
+    #[test]
+    fn validates_agentcore_identity_configuration() {
+        validate_agentcore_identity_config(
+            "ap-southeast-1",
+            "openab-codex",
+            "openab-github",
+            "https://openab.example.com/oauth/agentcore/callback",
+            "openab-slack",
+            &["read:user".into()],
+        )
+        .unwrap();
+        assert!(validate_agentcore_identity_config(
+            "ap-southeast-1",
+            "openab-codex",
+            "openab-github",
+            "http://openab.example.com/callback",
+            "openab-slack",
+            &["read:user".into()],
+        )
+        .is_err());
+        assert!(validate_agentcore_identity_config(
+            "ap-southeast-1.example.com",
+            "openab-codex",
+            "openab-github",
+            "https://openab.example.com/callback",
+            "openab-slack",
+            &["read:user".into()],
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "agentcore-identity")]
+    #[test]
+    fn maps_agentcore_identity_responses_without_exposing_session_state() {
+        let token = resource_token_outcome(ResourceTokenResponse {
+            access_token: Some("provider-secret".into()),
+            authorization_url: None,
+            session_status: None,
+        })
+        .unwrap();
+        assert_eq!(token, CredentialOutcome::Bearer("provider-secret".into()));
+
+        let challenge = resource_token_outcome(ResourceTokenResponse {
+            access_token: None,
+            authorization_url: Some("https://signin.example/authorize".into()),
+            session_status: Some("IN_PROGRESS".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            challenge,
+            CredentialOutcome::AuthorizationRequired {
+                authorization_url: "https://signin.example/authorize".into()
+            }
+        );
+
+        assert!(resource_token_outcome(ResourceTokenResponse {
+            access_token: None,
+            authorization_url: Some("http://signin.example/authorize".into()),
+            session_status: Some("IN_PROGRESS".into()),
+        })
+        .is_err());
+        assert!(resource_token_outcome(ResourceTokenResponse {
+            access_token: None,
+            authorization_url: Some("https://signin.example/authorize".into()),
+            session_status: Some("FAILED".into()),
+        })
+        .is_err());
     }
 }

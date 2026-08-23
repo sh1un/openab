@@ -43,6 +43,17 @@ rmcp = { version = "1.7", default-features = false, features = [
 # Serves the facade's Streamable HTTP endpoint (rmcp's StreamableHttpService
 # is a tower Service; axum provides the loopback listener + router).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+aws-config = { version = "1", optional = true }
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+
+[features]
+default = []
+agentcore-identity = [
+    "dep:aws-config",
+    "dep:aws-sigv4",
+    "dep:aws-credential-types",
+]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -2622,6 +2622,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sigv4",
  "axum",
  "base64",
  "getrandom 0.4.3",

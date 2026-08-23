@@ -774,7 +774,17 @@ impl McpRuntimeManager {
         let Some(provider_config) = server.credential_provider().cloned() else {
             return Ok(None);
         };
-        let credential = super::credential::from_config(&provider_config)?.credential(context)?;
+        let outcome = super::credential::from_config(&provider_config)?
+            .credential(context)
+            .await?;
+        let credential = match outcome {
+            super::credential::CredentialOutcome::Bearer(credential) => credential,
+            super::credential::CredentialOutcome::AuthorizationRequired { authorization_url } => {
+                anyhow::bail!(
+                    "authorization required for MCP server {name:?}; open this URL, complete consent, then retry: {authorization_url}"
+                )
+            }
+        };
         if let ServerConfig::Http {
             credential_provider,
             bearer_token,
