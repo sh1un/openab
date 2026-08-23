@@ -21,7 +21,11 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ErrorData as McpError;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+
+mod oauth;
+
+use oauth::{CallbackQuery, GithubOAuth, OAuthConfig};
 
 const UPSTREAM_NAME: &str = "github";
 const DEFAULT_GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
@@ -35,18 +39,19 @@ pub struct Config {
     pub audience: String,
     public_key_pem: String,
     connections: HashMap<String, String>,
+    oauth: Option<OAuthConfig>,
     pub request_timeout_secs: u64,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let connections_raw = required_env("OPENAB_GITHUB_BROKER_CONNECTIONS_JSON")?;
-        let connections: HashMap<String, String> = serde_json::from_str(&connections_raw)
-            .context("parse OPENAB_GITHUB_BROKER_CONNECTIONS_JSON as subject-to-token JSON map")?;
-        anyhow::ensure!(
-            !connections.is_empty(),
-            "GitHub connection map must not be empty"
-        );
+        let connections: HashMap<String, String> =
+            match std::env::var("OPENAB_GITHUB_BROKER_CONNECTIONS_JSON") {
+                Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw).context(
+                    "parse OPENAB_GITHUB_BROKER_CONNECTIONS_JSON as subject-to-token JSON map",
+                )?,
+                _ => HashMap::new(),
+            };
         for (subject, token) in &connections {
             anyhow::ensure!(
                 !subject.trim().is_empty(),
@@ -57,6 +62,11 @@ impl Config {
                 "GitHub connection token must not be empty"
             );
         }
+        let oauth = OAuthConfig::from_env()?;
+        anyhow::ensure!(
+            !connections.is_empty() || oauth.is_some(),
+            "configure either OPENAB_GITHUB_BROKER_CONNECTIONS_JSON or the GitHub App OAuth settings"
+        );
 
         let request_timeout_secs = std::env::var("OPENAB_GITHUB_BROKER_REQUEST_TIMEOUT_SECS")
             .ok()
@@ -85,6 +95,7 @@ impl Config {
             audience: required_env("OPENAB_GITHUB_BROKER_IDENTITY_AUDIENCE")?,
             public_key_pem: required_env("OPENAB_GITHUB_BROKER_IDENTITY_PUBLIC_KEY")?,
             connections,
+            oauth,
             request_timeout_secs,
         })
     }
@@ -170,6 +181,7 @@ impl IdentityVerifier {
 pub struct GithubBroker {
     verifier: IdentityVerifier,
     connections: Arc<HashMap<String, String>>,
+    oauth: Option<GithubOAuth>,
     upstream_url: Arc<str>,
     request_timeout_secs: u64,
 }
@@ -179,12 +191,13 @@ impl GithubBroker {
         Ok(Self {
             verifier: config.verifier()?,
             connections: Arc::new(config.connections.clone()),
+            oauth: config.oauth.clone().map(GithubOAuth::new).transpose()?,
             upstream_url: Arc::from(config.upstream_url.clone()),
             request_timeout_secs: config.request_timeout_secs,
         })
     }
 
-    fn delegated_credential(&self, extensions: &Extensions) -> Result<(String, String)> {
+    fn authenticated_subject(&self, extensions: &Extensions) -> Result<String> {
         let parts = extensions
             .get::<axum::http::request::Parts>()
             .context("authenticated HTTP request context required")?;
@@ -197,16 +210,60 @@ impl GithubBroker {
             .strip_prefix("Bearer ")
             .or_else(|| authorization.strip_prefix("bearer "))
             .context("Authorization header must use Bearer")?;
-        let subject = self.verifier.subject(bearer)?;
-        let github_token = self.github_token_for_subject(&subject)?;
-        Ok((subject, github_token))
+        self.verifier.subject(bearer)
     }
 
-    fn github_token_for_subject(&self, subject: &str) -> Result<String> {
+    async fn github_token_for_subject(&self, subject: &str) -> Result<String> {
+        if let Some(oauth) = &self.oauth {
+            if oauth.is_connected(subject).await {
+                return oauth.access_token(subject).await;
+            }
+        }
         self.connections
             .get(subject)
             .cloned()
             .ok_or_else(|| anyhow!("GitHub account is not connected for subject {subject:?}"))
+    }
+
+    async fn delegated_credential(&self, extensions: &Extensions) -> Result<(String, String)> {
+        let subject = self.authenticated_subject(extensions)?;
+        let github_token = self.github_token_for_subject(&subject).await?;
+        Ok((subject, github_token))
+    }
+
+    fn connect_tool() -> rmcp::model::Tool {
+        rmcp::model::Tool::new(
+            "connect_github",
+            "Create a short-lived GitHub App authorization URL for the authenticated Human. Use this when GitHub is not connected or when the Human asks to reconnect.",
+            Arc::new(
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                })
+                .as_object()
+                .expect("object schema")
+                .clone(),
+            ),
+        )
+    }
+
+    async fn begin_oauth(&self, extensions: &Extensions) -> Result<CallToolResult> {
+        let subject = self.authenticated_subject(extensions)?;
+        let oauth = self
+            .oauth
+            .as_ref()
+            .context("GitHub App OAuth is not configured")?;
+        let authorization_url = oauth.begin(subject.clone()).await?;
+        tracing::info!(%subject, "created delegated GitHub OAuth authorization URL");
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            serde_json::to_string(&json!({
+                "provider": "github",
+                "authorization_url": authorization_url,
+                "expires_in_seconds": 600,
+                "instructions": "Open this URL, authorize the GitHub App, then return to Slack and retry the GitHub request."
+            }))?,
+        )]))
     }
 
     fn runtime(&self, github_token: String) -> McpRuntimeManager {
@@ -219,12 +276,25 @@ impl GithubBroker {
     }
 
     async fn discover(&self, extensions: &Extensions) -> Result<Vec<rmcp::model::Tool>> {
-        let (subject, github_token) = self.delegated_credential(extensions)?;
+        let subject = self.authenticated_subject(extensions)?;
+        let mut tools = Vec::new();
+        if self.oauth.is_some() {
+            tools.push(Self::connect_tool());
+        }
+        let github_token = match self.github_token_for_subject(&subject).await {
+            Ok(token) => token,
+            Err(error) if self.oauth.is_some() => {
+                tracing::info!(%subject, %error, "delegated GitHub account is not connected");
+                return Ok(tools);
+            }
+            Err(error) => return Err(error),
+        };
         tracing::info!(%subject, "delegated GitHub MCP discovery");
         let runtime = self.runtime(github_token);
         let result = openab_mcp::mcp::discover_server_tools(&runtime, UPSTREAM_NAME).await;
         let _ = runtime.disconnect(UPSTREAM_NAME).await;
-        result
+        tools.extend(result?);
+        Ok(tools)
     }
 
     async fn invoke(
@@ -232,8 +302,18 @@ impl GithubBroker {
         extensions: &Extensions,
         request: CallToolRequestParams,
     ) -> Result<CallToolResult> {
-        let (subject, github_token) = self.delegated_credential(extensions)?;
         let tool = request.name.to_string();
+        if tool == "connect_github" {
+            anyhow::ensure!(
+                request
+                    .arguments
+                    .as_ref()
+                    .is_none_or(|arguments| arguments.is_empty()),
+                "connect_github does not accept arguments"
+            );
+            return self.begin_oauth(extensions).await;
+        }
+        let (subject, github_token) = self.delegated_credential(extensions).await?;
         tracing::info!(%subject, %tool, "delegated GitHub MCP call");
         let arguments = request.arguments.map(Value::Object).unwrap_or(Value::Null);
         let runtime = self.runtime(github_token);
@@ -293,6 +373,7 @@ pub fn router(config: Config) -> Result<axum::Router> {
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
     let broker = GithubBroker::new(&config)?;
+    let oauth = broker.oauth.clone();
     let server_config =
         StreamableHttpServerConfig::default().with_allowed_hosts(config.allowed_hosts.clone());
     let service = StreamableHttpService::new(
@@ -300,9 +381,20 @@ pub fn router(config: Config) -> Result<axum::Router> {
         LocalSessionManager::default().into(),
         server_config,
     );
-    Ok(axum::Router::new()
+    let mut router = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .nest_service("/mcp", service))
+        .nest_service("/mcp", service);
+    if let Some(oauth) = oauth {
+        router = router.route(
+            "/oauth/github/callback",
+            axum::routing::get(
+                move |axum::extract::Query(query): axum::extract::Query<CallbackQuery>| {
+                    oauth::callback_response(oauth.clone(), query)
+                },
+            ),
+        );
+    }
+    Ok(router)
 }
 
 #[cfg(test)]
@@ -336,6 +428,31 @@ KnypscJHThLt6CU5VS/ZpEpCrh8CcS99GW7BwYkKslVse7EMGIvfS70CoBtuTt65
                 ("employee-sh1un".into(), "github-user-token-a".into()),
                 ("employee-hr".into(), "github-user-token-b".into()),
             ]),
+            oauth: None,
+            request_timeout_secs: 5,
+        };
+        GithubBroker::new(&config).unwrap()
+    }
+
+    fn oauth_broker(store_path: std::path::PathBuf) -> GithubBroker {
+        let config = Config {
+            listen: "127.0.0.1:0".into(),
+            allowed_hosts: vec!["localhost".into()],
+            upstream_url: "https://example.invalid/mcp".into(),
+            issuer: "https://issuer.example".into(),
+            audience: "openab-github-broker".into(),
+            public_key_pem: TEST_PUBLIC_KEY.into(),
+            connections: HashMap::new(),
+            oauth: Some(OAuthConfig {
+                client_id: "github-app-client-id".into(),
+                client_secret: "github-app-client-secret".into(),
+                redirect_uri: "https://broker.example/oauth/github/callback".into(),
+                store_path,
+                store_key: [9; 32],
+                authorize_url: "https://github.example/oauth/authorize".into(),
+                token_url: "https://github.example/oauth/token".into(),
+                api_url: "https://api.github.example".into(),
+            }),
             request_timeout_secs: 5,
         };
         GithubBroker::new(&config).unwrap()
@@ -376,24 +493,35 @@ KnypscJHThLt6CU5VS/ZpEpCrh8CcS99GW7BwYkKslVse7EMGIvfS70CoBtuTt65
         assert!(verifier.subject(TEST_IDENTITY_JWT).is_err());
     }
 
-    #[test]
-    fn connection_lookup_is_subject_scoped() {
+    #[tokio::test]
+    async fn connection_lookup_is_subject_scoped() {
         let broker = broker();
         assert_ne!(
-            broker.github_token_for_subject("employee-sh1un").unwrap(),
-            broker.github_token_for_subject("employee-hr").unwrap()
+            broker
+                .github_token_for_subject("employee-sh1un")
+                .await
+                .unwrap(),
+            broker
+                .github_token_for_subject("employee-hr")
+                .await
+                .unwrap()
         );
-        assert!(broker.github_token_for_subject("unknown-human").is_err());
+        assert!(broker
+            .github_token_for_subject("unknown-human")
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn authenticated_requests_select_different_human_tokens() {
+    #[tokio::test]
+    async fn authenticated_requests_select_different_human_tokens() {
         let broker = broker();
         let (shiun_subject, shiun_token) = broker
             .delegated_credential(&request_extensions(Some(TEST_IDENTITY_JWT)))
+            .await
             .unwrap();
         let (hr_subject, hr_token) = broker
             .delegated_credential(&request_extensions(Some(TEST_HR_IDENTITY_JWT)))
+            .await
             .unwrap();
 
         assert_eq!(shiun_subject, "employee-sh1un");
@@ -401,6 +529,34 @@ KnypscJHThLt6CU5VS/ZpEpCrh8CcS99GW7BwYkKslVse7EMGIvfS70CoBtuTt65
         assert_eq!(shiun_token, "github-user-token-a");
         assert_eq!(hr_token, "github-user-token-b");
         assert_ne!(shiun_token, hr_token);
+    }
+
+    #[tokio::test]
+    async fn unconnected_oauth_human_sees_only_connect_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = oauth_broker(directory.path().join("connections.enc.json"));
+        let tools = broker
+            .discover(&request_extensions(Some(TEST_IDENTITY_JWT)))
+            .await
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "connect_github");
+    }
+
+    #[tokio::test]
+    async fn connect_url_uses_state_and_pkce_without_exposing_subject() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = oauth_broker(directory.path().join("connections.enc.json"));
+        let oauth = broker.oauth.as_ref().unwrap();
+        let url = oauth.begin("employee-sh1un".into()).await.unwrap();
+        let url = url::Url::parse(&url).unwrap();
+        let parameters: HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(parameters["client_id"], "github-app-client-id");
+        assert_eq!(parameters["code_challenge_method"], "S256");
+        assert!(parameters.contains_key("state"));
+        assert!(parameters.contains_key("code_challenge"));
+        assert!(!url.as_str().contains("employee-sh1un"));
+        assert!(!url.as_str().contains("github-app-client-secret"));
     }
 
     #[test]
@@ -422,10 +578,11 @@ KnypscJHThLt6CU5VS/ZpEpCrh8CcS99GW7BwYkKslVse7EMGIvfS70CoBtuTt65
         assert!(broker_allowed_hosts(Some("broker.example.com/mcp"), None).is_err());
     }
 
-    #[test]
-    fn missing_identity_header_fails_closed() {
+    #[tokio::test]
+    async fn missing_identity_header_fails_closed() {
         let err = broker()
             .delegated_credential(&request_extensions(None))
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("Authorization"), "got {err}");

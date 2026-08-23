@@ -35,9 +35,11 @@ other deployment hostnames, add comma-separated hostname or `host:port`
 authorities with `OPENAB_GITHUB_BROKER_ALLOWED_HOSTS`; do not include a URL
 scheme or path.
 
-The connection map is an MVP-only manual substitute for `/connect github`.
-Use Human credentials with the minimum repository permissions necessary. Never
-put this map on `openab-codex`; it belongs only on the broker service.
+The connection map is the original MVP and remains a backward-compatible
+fallback. For GitHub App OAuth, encrypted connection storage, token refresh,
+and the `connect_github` flow, follow
+[`github-app-user-oauth.md`](github-app-user-oauth.md). Never put either the
+map or GitHub App secrets on `openab-codex`; they belong only on the broker.
 
 ## 3. Register the broker in OpenAB's downstream `mcp.json`
 
@@ -58,7 +60,7 @@ put this map on `openab-codex`; it belongs only on the broker service.
         "ttl_seconds": 300
       },
       "tool_filter": {
-        "include": ["get_me", "get_file_contents", "search_code"]
+        "include": ["connect_github", "get_me", "get_file_contents", "search_code"]
       }
     }
   }
@@ -87,11 +89,12 @@ Expected:
 - A missing, forged, expired, or wrong-audience identity JWT is rejected before
   any GitHub MCP connection is opened.
 
-## MVP limitations
+## PAT MVP limitations
 
 - Tokens are configured manually and are not refreshed.
 - The JSON map is secret material; use the deployment platform's secret/env
   facility and deploy the broker in a different pod.
-- This proves credential routing, not the final OAuth UX. The next milestone is
-  GitHub App User Access Token OAuth with `/connect github`, encrypted storage,
-  refresh locking, revocation, and policy/audit enrichment.
+- This proves credential routing. GitHub App User Access Token OAuth and
+  encrypted single-replica storage are implemented separately; revocation,
+  organization enforcement, multi-replica locking, and policy/audit enrichment
+  remain follow-up work.

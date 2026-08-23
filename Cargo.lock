@@ -2622,13 +2622,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "jsonwebtoken",
  "openab-mcp",
+ "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

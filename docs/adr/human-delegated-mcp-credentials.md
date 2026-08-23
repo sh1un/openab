@@ -1,6 +1,6 @@
 # ADR: Human-Delegated MCP Credentials
 
-- **Status:** Proposed (MVP implemented for GitHub)
+- **Status:** Accepted (PAT routing and GitHub App User OAuth MVP implemented)
 - **Date:** 2026-08-16
 - **Related:** `end-user-identity-propagation.md`, `oab-mcp-adapter.md`
 
@@ -43,9 +43,16 @@ authorization; successful discovery is not an authorization grant.
 - fail-closed behavior for missing, invalid, expired, wrong-audience, or
   unconnected identities.
 
-The MVP uses an operator-provided JSON connection map. It deliberately does not
-yet implement GitHub App OAuth, encrypted database storage, refresh, account
-linking, or revocation UI.
+The first MVP used an operator-provided JSON connection map. The second
+milestone adds GitHub App User OAuth, PKCE, encrypted file storage, durable
+account linking, and serialized refresh-token rotation. The JSON map remains an
+optional migration fallback. See `docs/github-app-user-oauth.md`.
+
+The OAuth connection starts as an authenticated local MCP capability rather
+than an unauthenticated HTTP endpoint. `connect_github` derives the Human from
+the verified OpenAB JWT, creates a short-lived one-time state binding, and
+returns the GitHub authorization URL. The browser callback consumes that state;
+it never accepts an OpenAB subject from a query parameter.
 
 ## Consequences
 
@@ -56,5 +63,9 @@ linking, or revocation UI.
 - Each request currently creates a fresh upstream MCP runtime. This is slower
   but prevents cross-human connection/cache reuse. A future pool must key by
   `(provider, subject, credential_version)`.
-- Production storage must replace the environment JSON map with encrypted
-  GitHub App User Access Token records and serialized refresh per connection.
+- The encrypted file store is appropriate for a single-replica pilot. A
+  multi-replica production broker must replace it with transactional encrypted
+  storage and a distributed per-connection refresh lock.
+- Organization membership enforcement, revocation webhook processing,
+  disconnect/offboarding, and an append-only audit ledger remain required for
+  production.
