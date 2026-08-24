@@ -172,25 +172,34 @@ identity, credential provider, token vault, and identity directory resources
 used by this deployment:
 
 ```json
-{
-  "Effect": "Allow",
-  "Action": [
-    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
-    "bedrock-agentcore:GetResourceOauth2Token",
-    "bedrock-agentcore:CompleteResourceTokenAuth"
-  ],
-  "Resource": [
-    "<workload identity ARN>",
-    "<workload identity directory ARN>",
-    "<OAuth2 credential provider ARN>",
-    "<token vault ARN>"
-  ]
-}
+[
+  {
+    "Effect": "Allow",
+    "Action": [
+      "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+      "bedrock-agentcore:GetResourceOauth2Token",
+      "bedrock-agentcore:CompleteResourceTokenAuth"
+    ],
+    "Resource": [
+      "<workload identity ARN>",
+      "<workload identity directory ARN>",
+      "<OAuth2 credential provider ARN>",
+      "<token vault ARN>"
+    ]
+  },
+  {
+    "Effect": "Allow",
+    "Action": "secretsmanager:GetSecretValue",
+    "Resource": "arn:aws:secretsmanager:<region>:<account-id>:secret:bedrock-agentcore-identity!default/oauth2/<provider-name>-*"
+  }
+]
 ```
 
 Use the concrete ARNs produced in your account instead of granting
-`Resource: "*"`. Creating or updating the workload identity and OAuth provider
-is a control-plane setup task and should use a separate operator role.
+`Resource: "*"`. AgentCore stores the OAuth client secret in Secrets Manager,
+so the runtime also needs provider-specific `GetSecretValue` access. Creating or
+updating the workload identity and OAuth provider is a control-plane setup task
+and should use a separate operator role.
 
 ## Rollback
 

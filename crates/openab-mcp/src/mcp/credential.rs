@@ -452,14 +452,52 @@ async fn signed_post_bytes<T: Serialize>(region: &str, path: &str, request: &T) 
         .await
         .context("send AgentCore Identity request")?;
     let status = response.status();
-    if !status.is_success() {
-        anyhow::bail!("AgentCore Identity request failed with HTTP {status}");
-    }
-    response
+    let body = response
         .bytes()
         .await
         .map(|bytes| bytes.to_vec())
-        .context("read AgentCore Identity response")
+        .context("read AgentCore Identity response")?;
+    if !status.is_success() {
+        let detail = agentcore_error_detail(&body)
+            .map(|detail| format!(": {detail}"))
+            .unwrap_or_default();
+        anyhow::bail!("AgentCore Identity {path} failed with HTTP {status}{detail}");
+    }
+    Ok(body)
+}
+
+#[cfg(feature = "agentcore-identity")]
+fn agentcore_error_detail(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value
+        .get("__type")
+        .or_else(|| value.get("code"))
+        .or_else(|| value.get("Code"))
+        .and_then(serde_json::Value::as_str)
+        .map(safe_agentcore_error_text);
+    let message = value
+        .get("message")
+        .or_else(|| value.get("Message"))
+        .and_then(serde_json::Value::as_str)
+        .map(safe_agentcore_error_text);
+    match (
+        code.filter(|value| !value.is_empty()),
+        message.filter(|value| !value.is_empty()),
+    ) {
+        (Some(code), Some(message)) => Some(format!("{code}: {message}")),
+        (Some(code), None) => Some(code),
+        (None, Some(message)) => Some(message),
+        (None, None) => None,
+    }
+}
+
+#[cfg(feature = "agentcore-identity")]
+fn safe_agentcore_error_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control() || *ch == ' ')
+        .take(512)
+        .collect()
 }
 
 #[cfg(feature = "agentcore-identity")]
@@ -799,5 +837,17 @@ mod tests {
             session_uri: Some("urn:session:example".into()),
         })
         .is_err());
+    }
+
+    #[cfg(feature = "agentcore-identity")]
+    #[test]
+    fn reports_only_structured_agentcore_error_fields() {
+        let detail = agentcore_error_detail(
+            br#"{"__type":"AccessDeniedException","message":"missing permission","accessToken":"must-not-appear","authorizationUrl":"https://must-not-appear.example"}"#,
+        )
+        .unwrap();
+        assert_eq!(detail, "AccessDeniedException: missing permission");
+        assert!(!detail.contains("must-not-appear"));
+        assert!(agentcore_error_detail(b"not json").is_none());
     }
 }
