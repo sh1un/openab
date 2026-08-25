@@ -50,7 +50,8 @@ tool arguments, prompt text, and Slack display name cannot choose this value.
 The provider performs this data path:
 
 1. `GetWorkloadAccessTokenForUserId(workloadName, userId)` using the OpenAB
-   service's AWS workload credentials and SigV4.
+   service's AWS workload credentials through the official AWS AgentCore data
+   plane SDK, which owns request serialization and SigV4 signing.
 2. `GetResourceOauth2Token` using that workload token, a configured resource
    credential provider, and an explicit OAuth scope list.
 3. If an access token is returned, inject it as the downstream MCP bearer token.
@@ -87,8 +88,8 @@ separate listener from the loopback-only MCP Facade.
 - Existing installations and self-hosted brokers are unchanged.
 - AWS users can delegate OAuth token storage and refresh to AgentCore Identity.
 - Each configured MCP server can independently choose its credential strategy.
-- The AWS feature adds SigV4 and AWS configuration dependencies only to builds
-  that enable it.
+- The AWS feature adds the official AgentCore data-plane SDK and AWS
+  configuration dependencies only to builds that enable it.
 - Production user federation needs a public callback plus live confirmation
   from the initiating authenticated chat identity; callback arrival alone is
   not sufficient identity proof.

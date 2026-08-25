@@ -333,38 +333,6 @@ struct AgentCoreIdentityCredentialProvider {
 }
 
 #[cfg(feature = "agentcore-identity")]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkloadTokenRequest<'a> {
-    user_id: &'a str,
-    workload_name: &'a str,
-}
-
-#[cfg(feature = "agentcore-identity")]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkloadTokenResponse {
-    workload_access_token: String,
-}
-
-#[cfg(feature = "agentcore-identity")]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResourceTokenRequest<'a> {
-    workload_identity_token: &'a str,
-    resource_credential_provider_name: &'a str,
-    scopes: &'a [String],
-    oauth2_flow: &'static str,
-    resource_oauth2_return_url: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    custom_state: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    force_authentication: Option<bool>,
-}
-
-#[cfg(feature = "agentcore-identity")]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ResourceTokenResponse {
     access_token: Option<String>,
     authorization_url: Option<String>,
@@ -398,116 +366,65 @@ fn resource_token_outcome(response: ResourceTokenResponse) -> Result<CredentialO
 }
 
 #[cfg(feature = "agentcore-identity")]
-async fn signed_post_bytes<T: Serialize>(region: &str, path: &str, request: &T) -> Result<Vec<u8>> {
-    use aws_credential_types::provider::ProvideCredentials;
-    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
-    use aws_sigv4::sign::v4;
-    use std::time::SystemTime;
-
+async fn agentcore_client(region: &str) -> aws_sdk_bedrockagentcore::Client {
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()))
         .load()
         .await;
-    let credentials = sdk_config
-        .credentials_provider()
-        .context("no AWS credentials provider available for AgentCore Identity")?
-        .provide_credentials()
-        .await
-        .context("load AWS credentials for AgentCore Identity")?;
-    let identity = credentials.into();
-    let host = format!("bedrock-agentcore.{region}.amazonaws.com");
-    let url = format!("https://{host}{path}");
-    let body = serde_json::to_vec(request).context("serialize AgentCore Identity request")?;
-    let signing_params = v4::SigningParams::builder()
-        .identity(&identity)
-        .region(region)
-        .name("bedrock-agentcore")
-        .time(SystemTime::now())
-        .settings(SigningSettings::default())
-        .build()
-        .context("build AgentCore Identity signing parameters")?;
-    let headers = [
-        ("host", host.as_str()),
-        ("content-type", "application/json"),
-    ];
-    let signable = SignableRequest::new(
-        "POST",
-        &url,
-        headers.into_iter(),
-        SignableBody::Bytes(&body),
-    )?;
-    let (instructions, _) = sign(signable, &signing_params.into())?.into_parts();
+    aws_sdk_bedrockagentcore::Client::new(&sdk_config)
+}
 
-    let client = reqwest::Client::new();
-    let mut builder = client
-        .post(&url)
-        .header("host", &host)
-        .header("content-type", "application/json")
-        .body(body);
-    for (name, value) in instructions.headers() {
-        builder = builder.header(name, value);
-    }
-    let response = builder
+#[cfg(feature = "agentcore-identity")]
+async fn get_workload_token(
+    provider: &AgentCoreIdentityCredentialProvider,
+    user_id: &str,
+) -> Result<String> {
+    let response = agentcore_client(&provider.region)
+        .await
+        .get_workload_access_token_for_user_id()
+        .workload_name(&provider.workload_name)
+        .user_id(user_id)
         .send()
         .await
-        .context("send AgentCore Identity request")?;
-    let status = response.status();
-    let body = response
-        .bytes()
+        .context("AgentCore Identity GetWorkloadAccessTokenForUserId")?;
+    let token = response.workload_access_token().to_string();
+    anyhow::ensure!(
+        !token.is_empty(),
+        "AgentCore Identity returned an empty workload access token"
+    );
+    Ok(token)
+}
+
+#[cfg(feature = "agentcore-identity")]
+async fn get_resource_token(
+    provider: &AgentCoreIdentityCredentialProvider,
+    workload_identity_token: &str,
+    custom_state: Option<&str>,
+    force_authentication: Option<bool>,
+) -> Result<ResourceTokenResponse> {
+    use aws_sdk_bedrockagentcore::types::Oauth2FlowType;
+
+    let response = agentcore_client(&provider.region)
         .await
-        .map(|bytes| bytes.to_vec())
-        .context("read AgentCore Identity response")?;
-    if !status.is_success() {
-        let detail = agentcore_error_detail(&body)
-            .map(|detail| format!(": {detail}"))
-            .unwrap_or_default();
-        anyhow::bail!("AgentCore Identity {path} failed with HTTP {status}{detail}");
-    }
-    Ok(body)
-}
-
-#[cfg(feature = "agentcore-identity")]
-fn agentcore_error_detail(body: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let code = value
-        .get("__type")
-        .or_else(|| value.get("code"))
-        .or_else(|| value.get("Code"))
-        .and_then(serde_json::Value::as_str)
-        .map(safe_agentcore_error_text);
-    let message = value
-        .get("message")
-        .or_else(|| value.get("Message"))
-        .and_then(serde_json::Value::as_str)
-        .map(safe_agentcore_error_text);
-    match (
-        code.filter(|value| !value.is_empty()),
-        message.filter(|value| !value.is_empty()),
-    ) {
-        (Some(code), Some(message)) => Some(format!("{code}: {message}")),
-        (Some(code), None) => Some(code),
-        (None, Some(message)) => Some(message),
-        (None, None) => None,
-    }
-}
-
-#[cfg(feature = "agentcore-identity")]
-fn safe_agentcore_error_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_control() || *ch == ' ')
-        .take(512)
-        .collect()
-}
-
-#[cfg(feature = "agentcore-identity")]
-async fn signed_post<T: Serialize, R: for<'de> Deserialize<'de>>(
-    region: &str,
-    path: &str,
-    request: &T,
-) -> Result<R> {
-    let body = signed_post_bytes(region, path, request).await?;
-    serde_json::from_slice(&body).context("decode AgentCore Identity response")
+        .get_resource_oauth2_token()
+        .workload_identity_token(workload_identity_token)
+        .resource_credential_provider_name(&provider.resource_credential_provider_name)
+        .set_scopes(Some(provider.scopes.clone()))
+        .oauth2_flow(Oauth2FlowType::UserFederation)
+        .resource_oauth2_return_url(&provider.resource_oauth2_return_url)
+        .set_custom_state(custom_state.map(ToOwned::to_owned))
+        .set_force_authentication(force_authentication)
+        .send()
+        .await
+        .context("AgentCore Identity GetResourceOauth2Token")?;
+    Ok(ResourceTokenResponse {
+        access_token: response.access_token().map(ToOwned::to_owned),
+        authorization_url: response.authorization_url().map(ToOwned::to_owned),
+        session_status: response
+            .session_status()
+            .map(|value| value.as_str().to_string()),
+        session_uri: response.session_uri().map(ToOwned::to_owned),
+    })
 }
 
 #[cfg(feature = "agentcore-identity")]
@@ -518,33 +435,8 @@ impl CredentialProvider for AgentCoreIdentityCredentialProvider {
         context: &openab_context::ResolvedRequestContext,
     ) -> Result<CredentialOutcome> {
         let user_id = namespaced_user_id(&self.user_id_namespace, &context.identity.subject)?;
-        let workload: WorkloadTokenResponse = signed_post(
-            &self.region,
-            "/identities/GetWorkloadAccessTokenForUserId",
-            &WorkloadTokenRequest {
-                user_id: &user_id,
-                workload_name: &self.workload_name,
-            },
-        )
-        .await?;
-        anyhow::ensure!(
-            !workload.workload_access_token.is_empty(),
-            "AgentCore Identity returned an empty workload access token"
-        );
-        let resource: ResourceTokenResponse = signed_post(
-            &self.region,
-            "/identities/oauth2/token",
-            &ResourceTokenRequest {
-                workload_identity_token: &workload.workload_access_token,
-                resource_credential_provider_name: &self.resource_credential_provider_name,
-                scopes: &self.scopes,
-                oauth2_flow: "USER_FEDERATION",
-                resource_oauth2_return_url: &self.resource_oauth2_return_url,
-                custom_state: None,
-                force_authentication: None,
-            },
-        )
-        .await?;
+        let workload_identity_token = get_workload_token(self, &user_id).await?;
+        let resource = get_resource_token(self, &workload_identity_token, None, None).await?;
         resource_token_outcome(resource)
     }
 }
@@ -597,20 +489,8 @@ async fn workload_token(
     context: &openab_context::ResolvedRequestContext,
 ) -> Result<(String, String)> {
     let user_id = namespaced_user_id(&provider.user_id_namespace, &context.identity.subject)?;
-    let response: WorkloadTokenResponse = signed_post(
-        &provider.region,
-        "/identities/GetWorkloadAccessTokenForUserId",
-        &WorkloadTokenRequest {
-            user_id: &user_id,
-            workload_name: &provider.workload_name,
-        },
-    )
-    .await?;
-    anyhow::ensure!(
-        !response.workload_access_token.is_empty(),
-        "AgentCore Identity returned an empty workload access token"
-    );
-    Ok((user_id, response.workload_access_token))
+    let token = get_workload_token(provider, &user_id).await?;
+    Ok((user_id, token))
 }
 
 #[cfg(feature = "agentcore-identity")]
@@ -621,18 +501,11 @@ pub(crate) async fn begin_authorization(
 ) -> Result<AgentCoreAuthorizationStart> {
     let provider = identity_provider_from_config(config)?;
     let (_, workload_identity_token) = workload_token(&provider, context).await?;
-    let response: ResourceTokenResponse = signed_post(
-        &provider.region,
-        "/identities/oauth2/token",
-        &ResourceTokenRequest {
-            workload_identity_token: &workload_identity_token,
-            resource_credential_provider_name: &provider.resource_credential_provider_name,
-            scopes: &provider.scopes,
-            oauth2_flow: "USER_FEDERATION",
-            resource_oauth2_return_url: &provider.resource_oauth2_return_url,
-            custom_state: Some(custom_state),
-            force_authentication: Some(true),
-        },
+    let response = get_resource_token(
+        &provider,
+        &workload_identity_token,
+        Some(custom_state),
+        Some(true),
     )
     .await?;
     anyhow::ensure!(
@@ -661,21 +534,6 @@ pub(crate) async fn begin_authorization(
 }
 
 #[cfg(feature = "agentcore-identity")]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CompleteResourceTokenAuthRequest<'a> {
-    session_uri: &'a str,
-    user_identifier: UserIdentifier<'a>,
-}
-
-#[cfg(feature = "agentcore-identity")]
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UserIdentifier<'a> {
-    user_id: &'a str,
-}
-
-#[cfg(feature = "agentcore-identity")]
 pub(crate) async fn complete_authorization(
     config: &CredentialProviderConfig,
     context: &openab_context::ResolvedRequestContext,
@@ -684,19 +542,16 @@ pub(crate) async fn complete_authorization(
     validate_session_uri(session_uri)?;
     let provider = identity_provider_from_config(config)?;
     let user_id = namespaced_user_id(&provider.user_id_namespace, &context.identity.subject)?;
-    let response = signed_post_bytes(
-        &provider.region,
-        "/identities/CompleteResourceTokenAuth",
-        &CompleteResourceTokenAuthRequest {
-            session_uri,
-            user_identifier: UserIdentifier { user_id: &user_id },
-        },
-    )
-    .await?;
-    anyhow::ensure!(
-        response.is_empty(),
-        "AgentCore Identity completion returned an unexpected response body"
-    );
+    agentcore_client(&provider.region)
+        .await
+        .complete_resource_token_auth()
+        .session_uri(session_uri)
+        .user_identifier(aws_sdk_bedrockagentcore::types::UserIdentifier::UserId(
+            user_id,
+        ))
+        .send()
+        .await
+        .context("AgentCore Identity CompleteResourceTokenAuth")?;
     Ok(())
 }
 
@@ -837,17 +692,5 @@ mod tests {
             session_uri: Some("urn:session:example".into()),
         })
         .is_err());
-    }
-
-    #[cfg(feature = "agentcore-identity")]
-    #[test]
-    fn reports_only_structured_agentcore_error_fields() {
-        let detail = agentcore_error_detail(
-            br#"{"__type":"AccessDeniedException","message":"missing permission","accessToken":"must-not-appear","authorizationUrl":"https://must-not-appear.example"}"#,
-        )
-        .unwrap();
-        assert_eq!(detail, "AccessDeniedException: missing permission");
-        assert!(!detail.contains("must-not-appear"));
-        assert!(agentcore_error_detail(b"not json").is_none());
     }
 }
