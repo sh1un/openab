@@ -749,8 +749,8 @@ mod tests {
 
     /// Full-HTTP-path proof of the session mechanism: a real request through
     /// the router (rmcp StreamableHttpService) must surface the
-    /// `Authorization` header to the handler via request extensions, and the
-    /// same request without the header must fall back to the anonymous view.
+    /// supported session-token headers to the handler via request extensions,
+    /// and the same request without a header must fall back to the anonymous view.
     /// This is the one behavior unit tests cannot fake — it depends on
     /// rmcp's `Parts`-into-extensions injection and cross-crate `http` type
     /// unification.
@@ -769,7 +769,10 @@ mod tests {
             tokens,
         );
 
-        let post = |body: String, bearer: Option<String>, session: Option<String>| {
+        let post = |body: String,
+                    bearer: Option<String>,
+                    dedicated: Option<String>,
+                    session: Option<String>| {
             let mut b = axum::http::Request::builder()
                 .method("POST")
                 .uri("/mcp")
@@ -779,6 +782,9 @@ mod tests {
                 .header("host", "127.0.0.1");
             if let Some(t) = bearer {
                 b = b.header("authorization", format!("Bearer {t}"));
+            }
+            if let Some(t) = dedicated {
+                b = b.header("x-openab-session-token", t);
             }
             if let Some(s) = session {
                 b = b.header("mcp-session-id", s);
@@ -798,14 +804,14 @@ mod tests {
         .to_string();
 
         // One MCP session per identity variant (initialize → session id → call).
-        let run = |bearer: Option<String>| {
+        let run = |bearer: Option<String>, dedicated: Option<String>| {
             let router = router.clone();
             let init_body = init_body.clone();
             let search_body = search_body.clone();
             async move {
                 let resp = router
                     .clone()
-                    .oneshot(post(init_body, bearer.clone(), None))
+                    .oneshot(post(init_body, bearer.clone(), dedicated.clone(), None))
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), 200, "initialize must succeed");
@@ -817,7 +823,7 @@ mod tests {
                     .unwrap()
                     .to_string();
                 let resp = router
-                    .oneshot(post(search_body, bearer, Some(sid)))
+                    .oneshot(post(search_body, bearer, dedicated, Some(sid)))
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), 200);
@@ -826,17 +832,22 @@ mod tests {
             }
         };
 
-        let with_token = run(Some(tok)).await;
+        let with_token = run(Some(tok.clone()), None).await;
         assert!(
             with_token.contains("echo_channel"),
             "session-token request must see the session-bound source: {with_token}"
         );
-        let anonymous = run(None).await;
+        let with_dedicated_header = run(None, Some(tok)).await;
+        assert!(
+            with_dedicated_header.contains("echo_channel"),
+            "dedicated session-token header must see the session-bound source: {with_dedicated_header}"
+        );
+        let anonymous = run(None, None).await;
         assert!(
             !anonymous.contains("echo_channel"),
             "anonymous request must NOT see the session-bound source: {anonymous}"
         );
-        let wrong = run(Some("wrong-token".into())).await;
+        let wrong = run(Some("wrong-token".into()), None).await;
         assert!(
             !wrong.contains("echo_channel"),
             "unknown token must resolve to the anonymous view: {wrong}"

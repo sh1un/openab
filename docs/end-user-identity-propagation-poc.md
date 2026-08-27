@@ -83,6 +83,19 @@ adapter's documented `CODEX_CONFIG` environment variable:
 CODEX_CONFIG = '''{"mcp_servers":{"openab":{"url":"http://127.0.0.1:8848/mcp","bearer_token_env_var":"OPENAB_SESSION_TOKEN"}}}'''
 ```
 
+Codex versions that do not forward `bearer_token_env_var` to Streamable HTTP
+must use an environment-backed dedicated header instead:
+
+```toml
+[agent.env]
+CODEX_CONFIG = '''{"mcp_servers":{"openab":{"url":"http://127.0.0.1:8848/mcp","env_http_headers":{"X-OpenAB-Session-Token":"OPENAB_SESSION_TOKEN"}}}}'''
+```
+
+The value remains in the child process environment; the static configuration
+contains only the environment variable name. The Facade accepts this dedicated
+header as an alternative to `Authorization: Bearer` and resolves both through
+the same opaque session-token registry.
+
 OpenAB mints `OPENAB_SESSION_TOKEN` per ACP session and injects it into that
 agent process. Do not put the AgentCore signing-key environment variable in
 `[agent.env]` or `[agent].inherit_env`; the signing key belongs only to the
