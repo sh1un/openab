@@ -71,20 +71,23 @@ in either config file. Configure the Gateway `CUSTOM_JWT` authorizer with the
 matching discovery URL, audience/client, and JWKS public key. AgentCore Gateway
 Policy evaluates `principal` from `sub` and may inspect the `groups` claim.
 
-Wire the generated `.openab/mcp-facade.json` into the ACP agent using the normal
-agent-specific MCP configuration mechanism. This is transport wiring only; no
-Hermes-specific identity code is required.
+OpenAB advertises the Facade in ACP `session/new` and `session/load` through the
+standard `mcpServers` field. The advertisement includes the opaque,
+session-scoped credential in an `X-OpenAB-Session-Token` HTTP header. It travels
+over the local ACP control channel, is redacted from ACP debug logs, and is not
+written to the shared workdir or added to the model prompt.
 
-For the Codex image, pass the Facade as session configuration through the
-adapter's documented `CODEX_CONFIG` environment variable:
+The generated `.openab/mcp-facade.json` remains an operator-facing compatibility
+artifact for ACP agents that do not honor `mcpServers`. Static Codex wiring via
+the adapter's documented `CODEX_CONFIG` environment variable is also a fallback:
 
 ```toml
 [agent.env]
 CODEX_CONFIG = '''{"mcp_servers":{"openab":{"url":"http://127.0.0.1:8848/mcp","bearer_token_env_var":"OPENAB_SESSION_TOKEN"}}}'''
 ```
 
-Codex versions that do not forward `bearer_token_env_var` to Streamable HTTP
-must use an environment-backed dedicated header instead:
+Codex versions that do not forward `bearer_token_env_var` to Streamable HTTP may
+use an environment-backed dedicated header when ACP injection is unavailable:
 
 ```toml
 [agent.env]

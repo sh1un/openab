@@ -562,6 +562,13 @@ impl SessionPool {
         )
         .await?;
 
+        #[cfg(feature = "acp-mcp")]
+        if let (Some(facade_url), Some(token)) =
+            (self.facade_url.as_deref(), session_token.as_deref())
+        {
+            new_conn.set_facade_mcp_server(facade_url, token);
+        }
+
         new_conn.initialize().await?;
 
         let mut resumed = false;
