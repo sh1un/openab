@@ -77,6 +77,15 @@ session-scoped credential in an `X-OpenAB-Session-Token` HTTP header. It travels
 over the local ACP control channel, is redacted from ACP debug logs, and is not
 written to the shared workdir or added to the model prompt.
 
+For `codex-acp`, OpenAB also mirrors that entry into the spawned process's
+in-memory `CODEX_CONFIG` using a literal `http_headers` value. This compatibility
+bridge is required by Codex 0.144.x, which accepts the per-thread ACP MCP URL but
+does not consistently apply its per-thread header values. Each Slack session has
+its own `codex-acp` process, so the credential remains session-scoped; malformed
+`CODEX_CONFIG` fails the session closed instead of starting an unauthenticated
+Facade connection. Other ACP agents receive only the standard `mcpServers`
+advertisement.
+
 The generated `.openab/mcp-facade.json` remains an operator-facing compatibility
 artifact for ACP agents that do not honor `mcpServers`. Static Codex wiring via
 the adapter's documented `CODEX_CONFIG` environment variable is also a fallback:

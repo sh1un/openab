@@ -445,6 +445,12 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   ACP agents because it binds the Facade credential to the correct session
   without editing the CLI's persistent config. ACP payload logging redacts the
   credential.
+- **Codex compatibility:** Codex 0.144.x accepts a per-thread MCP URL from
+  `codex-acp` but may omit its per-thread HTTP headers. For `codex-acp` only,
+  the broker therefore mirrors the same URL and session token into the child
+  process's in-memory `CODEX_CONFIG.http_headers`. The value is neither written
+  to the workdir nor logged, malformed config fails closed, and all other ACP
+  agents continue to use the standard advertisement alone.
 
 This is the same architectural role that
 [`acp-server-websocket-reverse-mcp.md`](./acp-server-websocket-reverse-mcp.md)
