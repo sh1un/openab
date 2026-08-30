@@ -88,7 +88,8 @@ Configure only the MCP servers that should use AgentCore Identity in
         "resource_oauth2_return_url": "https://openab.example.com/oauth/agentcore/callback",
         "connection_name": "jira",
         "user_id_namespace": "openab-slack",
-        "scopes": ["read:jira-work", "write:jira-work", "offline_access"]
+        "scopes": ["read:jira-work", "write:jira-work", "offline_access"],
+        "resources": ["https://your-jira-mcp.example.com/mcp"]
       }
     }
   }
@@ -102,6 +103,10 @@ be supplied by the model.
 
 The callback URL must be registered as an allowed resource OAuth return URL on
 the AgentCore workload identity. Keep scopes minimal and provider-specific.
+`resources` is optional and maps to the OAuth 2.0 resource indicator sent to
+AgentCore Identity. Configure it when the downstream authorization server's
+protected-resource metadata advertises a `resource` value. Omitting it keeps
+the previous behavior for providers that do not require resource-bound tokens.
 
 Enable the public callback listener in `config.toml`. Zeabur terminates TLS and
 forwards the public HTTPS route to this container port:

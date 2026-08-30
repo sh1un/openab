@@ -32,6 +32,10 @@ pub enum CredentialProviderConfig {
         #[serde(default = "default_user_id_namespace")]
         user_id_namespace: String,
         scopes: Vec<String>,
+        /// Optional RFC 8707 resource indicators for resource-bound OAuth
+        /// tokens, such as an OAuth-protected MCP server URL.
+        #[serde(default)]
+        resources: Vec<String>,
     },
 }
 
@@ -96,6 +100,7 @@ pub fn from_config(config: &CredentialProviderConfig) -> Result<Box<dyn Credenti
             connection_name,
             user_id_namespace,
             scopes,
+            resources,
         } => {
             validate_agentcore_identity_config(
                 region,
@@ -106,6 +111,7 @@ pub fn from_config(config: &CredentialProviderConfig) -> Result<Box<dyn Credenti
                 user_id_namespace,
                 scopes,
             )?;
+            validate_agentcore_identity_resources(resources)?;
             #[cfg(feature = "agentcore-identity")]
             {
                 Ok(Box::new(AgentCoreIdentityCredentialProvider {
@@ -115,6 +121,7 @@ pub fn from_config(config: &CredentialProviderConfig) -> Result<Box<dyn Credenti
                     resource_oauth2_return_url: resource_oauth2_return_url.clone(),
                     user_id_namespace: user_id_namespace.clone(),
                     scopes: scopes.clone(),
+                    resources: resources.clone(),
                 }))
             }
             #[cfg(not(feature = "agentcore-identity"))]
@@ -181,6 +188,16 @@ pub(crate) fn validate_agentcore_identity_config(
     anyhow::ensure!(
         !scopes.is_empty() && scopes.iter().all(|scope| !scope.trim().is_empty()),
         "agentcore_identity scopes must contain at least one non-empty scope"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_agentcore_identity_resources(resources: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        resources.iter().all(|resource| {
+            (1..=2048).contains(&resource.len()) && url::Url::parse(resource).is_ok()
+        }),
+        "agentcore_identity resources must contain only non-empty absolute URIs up to 2048 bytes"
     );
     Ok(())
 }
@@ -330,6 +347,7 @@ struct AgentCoreIdentityCredentialProvider {
     resource_oauth2_return_url: String,
     user_id_namespace: String,
     scopes: Vec<String>,
+    resources: Vec<String>,
 }
 
 #[cfg(feature = "agentcore-identity")]
@@ -410,6 +428,7 @@ async fn get_resource_token(
         .workload_identity_token(workload_identity_token)
         .resource_credential_provider_name(&provider.resource_credential_provider_name)
         .set_scopes(Some(provider.scopes.clone()))
+        .set_resources((!provider.resources.is_empty()).then(|| provider.resources.clone()))
         .oauth2_flow(Oauth2FlowType::UserFederation)
         .resource_oauth2_return_url(&provider.resource_oauth2_return_url)
         .set_custom_state(custom_state.map(ToOwned::to_owned))
@@ -460,6 +479,7 @@ fn identity_provider_from_config(
         connection_name: _,
         user_id_namespace,
         scopes,
+        resources,
     } = config
     else {
         anyhow::bail!("credential provider is not agentcore_identity");
@@ -473,6 +493,7 @@ fn identity_provider_from_config(
         user_id_namespace,
         scopes,
     )?;
+    validate_agentcore_identity_resources(resources)?;
     Ok(AgentCoreIdentityCredentialProvider {
         region: region.clone(),
         workload_name: workload_name.clone(),
@@ -480,6 +501,7 @@ fn identity_provider_from_config(
         resource_oauth2_return_url: resource_oauth2_return_url.clone(),
         user_id_namespace: user_id_namespace.clone(),
         scopes: scopes.clone(),
+        resources: resources.clone(),
     })
 }
 
@@ -650,6 +672,7 @@ mod tests {
             &["read:user".into()],
         )
         .is_err());
+        assert!(validate_agentcore_identity_resources(&["not an absolute URI".into()]).is_err());
     }
 
     #[cfg(feature = "agentcore-identity")]

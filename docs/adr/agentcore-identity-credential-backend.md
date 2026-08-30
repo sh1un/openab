@@ -53,7 +53,8 @@ The provider performs this data path:
    service's AWS workload credentials through the official AWS AgentCore data
    plane SDK, which owns request serialization and SigV4 signing.
 2. `GetResourceOauth2Token` using that workload token, a configured resource
-   credential provider, and an explicit OAuth scope list.
+   credential provider, an explicit OAuth scope list, and optional RFC 8707
+   resource indicators.
 3. If an access token is returned, inject it as the downstream MCP bearer token.
 4. If user consent is required, expose synthetic `connect_<name>` and
    `complete_<name>` capabilities. Never log or return the workload token or

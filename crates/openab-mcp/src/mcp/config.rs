@@ -131,7 +131,8 @@ impl ServerConfig {
     pub fn credential_provider(&self) -> Option<&CredentialProviderConfig> {
         match self {
             ServerConfig::Http {
-                credential_provider, ..
+                credential_provider,
+                ..
             } => credential_provider.as_deref(),
             ServerConfig::Stdio { .. } => None,
         }
@@ -500,6 +501,7 @@ impl McpConfig {
                     connection_name,
                     user_id_namespace,
                     scopes,
+                    resources,
                 } = provider
                 {
                     super::credential::validate_agentcore_identity_config(
@@ -511,6 +513,7 @@ impl McpConfig {
                         user_id_namespace,
                         scopes,
                     )?;
+                    super::credential::validate_agentcore_identity_resources(resources)?;
                     let connection_name = super::credential::connection_name(provider, name)
                         .context("derive agentcore_identity connection name")?;
                     anyhow::ensure!(
@@ -654,7 +657,8 @@ mod tests {
                 "resource_credential_provider_name": "openab-github",
                 "resource_oauth2_return_url": "https://openab.example.com/oauth/agentcore/callback",
                 "connection_name": "github",
-                "scopes": ["read:user", "repo"]
+                "scopes": ["read:user", "repo"],
+                "resources": ["https://api.github.example/mcp"]
             }
         }))
         .unwrap();
@@ -663,6 +667,7 @@ mod tests {
             user_id_namespace,
             connection_name,
             scopes,
+            resources,
             ..
         } = server.credential_provider().unwrap()
         else {
@@ -671,6 +676,31 @@ mod tests {
         assert_eq!(user_id_namespace, "openab");
         assert_eq!(connection_name.as_deref(), Some("github"));
         assert_eq!(scopes, &["read:user", "repo"]);
+        assert_eq!(resources, &["https://api.github.example/mcp"]);
+    }
+
+    #[test]
+    fn agentcore_identity_resources_default_to_empty() {
+        let server: ServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": "https://github-mcp.example/mcp",
+            "credential_provider": {
+                "type": "agentcore_identity",
+                "region": "ap-southeast-1",
+                "workload_name": "openab-codex",
+                "resource_credential_provider_name": "openab-github",
+                "resource_oauth2_return_url": "https://openab.example.com/oauth/agentcore/callback",
+                "scopes": ["read:user"]
+            }
+        }))
+        .unwrap();
+
+        let CredentialProviderConfig::AgentcoreIdentity { resources, .. } =
+            server.credential_provider().unwrap()
+        else {
+            panic!("expected AgentcoreIdentity credential provider");
+        };
+        assert!(resources.is_empty());
     }
 
     #[test]
@@ -687,6 +717,7 @@ mod tests {
                 connection_name: Some("github".into()),
                 user_id_namespace: "openab-slack".into(),
                 scopes: vec!["read:user".into()],
+                resources: vec![],
             })),
             bearer_token: None,
             tool_filter: None,
