@@ -122,9 +122,11 @@ Kubernetes ingress; the externally registered callback URL must use HTTPS.
 |-----|------|---------|-------------|
 | `listen` | string | `"0.0.0.0:8080"` | Container bind address. The callback route is `/oauth/agentcore/callback`; health is `/healthz`. |
 
-The callback never trusts browser arrival as Human identity. It displays a
-short-lived confirmation code that must be submitted through the originating
-authenticated chat identity. See [AgentCore Identity Credential Backend](agentcore-identity.md).
+The callback never trusts browser arrival as Human identity. After validating
+the OAuth state, it generates and displays a distinct, short-lived `OAB-`
+confirmation code that must be submitted through the originating authenticated
+chat identity. OAuth state values from authorization URLs are not accepted as
+confirmation codes. See [AgentCore Identity Credential Backend](agentcore-identity.md).
 
 ---
 

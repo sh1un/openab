@@ -126,8 +126,10 @@ names selected by `connection_name`). The chat-native flow is:
    the returned short-lived session URI in memory.
 3. The Human opens `authorization_url` and authorizes GitHub.
 4. AgentCore redirects the browser to the public callback. The callback checks
-   the session and displays a one-time confirmation code; it does **not** bind
-   identity yet.
+   the session and `customState`, then generates and displays a distinct
+   `OAB-`-prefixed one-time confirmation code; it does **not** bind identity
+   yet. The OAuth state from `authorization_url` is never accepted as this
+   confirmation code.
 5. The Human returns to the same Slack conversation and executes
    `complete_github` with `confirmation_code`.
 6. The Facade obtains the live trusted Slack identity, verifies it matches the
@@ -137,9 +139,10 @@ names selected by `connection_name`). The chat-native flow is:
 
 This extra Slack confirmation is deliberate. A browser callback has no Slack
 login cookie, so callback arrival alone cannot prove who clicked a forwarded
-authorization link. The one-time code is not a GitHub or AWS credential, is
-valid for ten minutes, is scoped to one subject and connection, and is removed
-after successful completion.
+authorization link. The one-time code is generated only after the callback,
+is independent from the OAuth state visible in the authorization URL, is not a
+GitHub or AWS credential, is valid for ten minutes, is scoped to one subject
+and connection, and is removed after successful completion.
 
 Pending sessions are memory-only. Restarting OpenAB invalidates outstanding
 links but does not remove completed credentials from AgentCore's token vault.

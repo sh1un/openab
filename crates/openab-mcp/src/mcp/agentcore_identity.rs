@@ -36,7 +36,8 @@ struct Connection {
 
 #[derive(Debug, Clone)]
 struct PendingAuthorization {
-    code: String,
+    oauth_state: String,
+    confirmation_code: Option<String>,
     server: String,
     connection_name: String,
     subject: String,
@@ -69,6 +70,12 @@ fn now_epoch() -> u64 {
 fn confirmation_code() -> Result<String> {
     let mut bytes = [0_u8; 12];
     getrandom::fill(&mut bytes).context("generate AgentCore authorization confirmation code")?;
+    Ok(format!("OAB-{}", URL_SAFE_NO_PAD.encode(bytes)))
+}
+
+fn oauth_state() -> Result<String> {
+    let mut bytes = [0_u8; 24];
+    getrandom::fill(&mut bytes).context("generate AgentCore authorization OAuth state")?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -84,7 +91,7 @@ impl Coordinator {
             entries.len() < MAX_PENDING,
             "too many pending AgentCore Identity authorization sessions"
         );
-        entries.insert(pending.code.clone(), pending);
+        entries.insert(pending.session_uri.clone(), pending);
         Ok(())
     }
 
@@ -100,14 +107,19 @@ impl Coordinator {
             .values_mut()
             .find(|value| value.session_uri == session_uri)
             .context("authorization session is invalid, expired, or already completed")?;
-        if let Some(custom_state) = custom_state {
-            anyhow::ensure!(
-                constant_time_eq(custom_state.as_bytes(), pending.code.as_bytes()),
-                "authorization callback state does not match"
-            );
-        }
+        let custom_state = custom_state.context("authorization callback state is missing")?;
+        anyhow::ensure!(
+            constant_time_eq(custom_state.as_bytes(), pending.oauth_state.as_bytes()),
+            "authorization callback state does not match"
+        );
         pending.browser_returned = true;
-        Ok(pending.code.clone())
+        if pending.confirmation_code.is_none() {
+            pending.confirmation_code = Some(confirmation_code()?);
+        }
+        pending
+            .confirmation_code
+            .clone()
+            .context("authorization confirmation code was not generated")
     }
 
     async fn claim(
@@ -120,7 +132,15 @@ impl Coordinator {
         let mut entries = self.pending.lock().await;
         entries.retain(|_, value| now.saturating_sub(value.created_at) <= PENDING_TTL.as_secs());
         let pending = entries
-            .get_mut(code)
+            .values_mut()
+            .find(|pending| {
+                pending
+                    .confirmation_code
+                    .as_deref()
+                    .is_some_and(|candidate| {
+                        constant_time_eq(code.as_bytes(), candidate.as_bytes())
+                    })
+            })
             .context("confirmation code is invalid, expired, or already used")?;
         anyhow::ensure!(
             constant_time_eq(subject.as_bytes(), pending.subject.as_bytes()),
@@ -146,13 +166,18 @@ impl Coordinator {
         let mut entries = self.pending.lock().await;
         if success {
             if entries
-                .get(code)
-                .is_some_and(|pending| pending.session_uri == session_uri)
+                .get(session_uri)
+                .and_then(|pending| pending.confirmation_code.as_deref())
+                .is_some_and(|candidate| constant_time_eq(code.as_bytes(), candidate.as_bytes()))
             {
-                entries.remove(code);
+                entries.remove(session_uri);
             }
-        } else if let Some(pending) = entries.get_mut(code) {
-            if pending.session_uri == session_uri {
+        } else if let Some(pending) = entries.get_mut(session_uri) {
+            if pending
+                .confirmation_code
+                .as_deref()
+                .is_some_and(|candidate| constant_time_eq(code.as_bytes(), candidate.as_bytes()))
+            {
                 pending.completing = false;
             }
         }
@@ -214,11 +239,13 @@ impl AgentCoreIdentitySource {
         connection: &Connection,
         request: &openab_context::ResolvedRequestContext,
     ) -> Result<Value> {
-        let code = confirmation_code()?;
-        let start = credential::begin_authorization(&connection.config, request, &code).await?;
+        let oauth_state = oauth_state()?;
+        let start =
+            credential::begin_authorization(&connection.config, request, &oauth_state).await?;
         self.coordinator
             .insert(PendingAuthorization {
-                code,
+                oauth_state,
+                confirmation_code: None,
                 server: connection.server.clone(),
                 connection_name: connection.name.clone(),
                 subject: request.identity.subject.clone(),
@@ -287,7 +314,8 @@ impl CapabilitySource for AgentCoreIdentitySource {
                 "properties": {
                     "confirmation_code": {
                         "type": "string",
-                        "description": "One-time code shown by the OpenAB AgentCore Identity callback page."
+                        "pattern": "^OAB-[A-Za-z0-9_-]{16}$",
+                        "description": "One-time OAB-prefixed code shown by the OpenAB AgentCore Identity callback page after OAuth consent. Never use or derive this value from the authorization URL or its state parameter."
                     }
                 },
                 "required": ["confirmation_code"],
@@ -426,9 +454,10 @@ pub async fn serve_callback(addr: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn pending(code: &str, subject: &str, session_uri: &str) -> PendingAuthorization {
+    fn pending(oauth_state: &str, subject: &str, session_uri: &str) -> PendingAuthorization {
         PendingAuthorization {
-            code: code.into(),
+            oauth_state: oauth_state.into(),
+            confirmation_code: None,
             server: "github-human".into(),
             connection_name: "github".into(),
             subject: subject.into(),
@@ -443,21 +472,30 @@ mod tests {
     async fn callback_then_same_human_can_claim_once() {
         let coordinator = Coordinator::default();
         coordinator
-            .insert(pending("code-a", "employee-sh1un", "urn:session:a"))
+            .insert(pending("state-a", "employee-sh1un", "urn:session:a"))
             .await
             .unwrap();
+        assert!(coordinator
+            .claim("state-a", "employee-sh1un", "github")
+            .await
+            .is_err());
         let code = coordinator
-            .mark_browser_returned("urn:session:a", Some("code-a"))
+            .mark_browser_returned("urn:session:a", Some("state-a"))
             .await
             .unwrap();
-        assert_eq!(code, "code-a");
+        assert!(code.starts_with("OAB-"));
+        assert_ne!(code, "state-a");
+        assert!(coordinator
+            .claim("state-a", "employee-sh1un", "github")
+            .await
+            .is_err());
         let claimed = coordinator
-            .claim("code-a", "employee-sh1un", "github")
+            .claim(&code, "employee-sh1un", "github")
             .await
             .unwrap();
         assert_eq!(claimed.session_uri, "urn:session:a");
         assert!(coordinator
-            .claim("code-a", "employee-sh1un", "github")
+            .claim(&code, "employee-sh1un", "github")
             .await
             .is_err());
     }
@@ -466,17 +504,42 @@ mod tests {
     async fn different_human_cannot_claim_forwarded_flow() {
         let coordinator = Coordinator::default();
         coordinator
-            .insert(pending("code-b", "employee-sh1un", "urn:session:b"))
+            .insert(pending("state-b", "employee-sh1un", "urn:session:b"))
             .await
             .unwrap();
-        coordinator
-            .mark_browser_returned("urn:session:b", None)
+        let code = coordinator
+            .mark_browser_returned("urn:session:b", Some("state-b"))
             .await
             .unwrap();
         assert!(coordinator
-            .claim("code-b", "employee-hr", "github")
+            .claim(&code, "employee-hr", "github")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn callback_requires_the_matching_oauth_state() {
+        let coordinator = Coordinator::default();
+        coordinator
+            .insert(pending("state-c", "employee-sh1un", "urn:session:c"))
+            .await
+            .unwrap();
+
+        assert!(coordinator
+            .mark_browser_returned("urn:session:c", None)
+            .await
+            .is_err());
+        assert!(coordinator
+            .mark_browser_returned("urn:session:c", Some("wrong-state"))
+            .await
+            .is_err());
+
+        let code = coordinator
+            .mark_browser_returned("urn:session:c", Some("state-c"))
+            .await
+            .unwrap();
+        assert!(code.starts_with("OAB-"));
+        assert_ne!(code, "state-c");
     }
 
     #[test]
