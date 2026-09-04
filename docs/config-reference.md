@@ -361,6 +361,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
+| `profile` | table | absent | Opt-in contract for adopting an existing Hermes profile. See `[agent.profile]` below. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
@@ -444,6 +445,79 @@ working_dir = "/home/agent"
 command = "hermes-acp"
 working_dir = "/home/agent"
 ```
+
+### `[agent.profile]`
+
+`[agent.profile]` is an opt-in startup gate for adopting an existing Hermes
+configuration without baking personality, skills, or secrets into the OpenAB
+image. When absent, OpenAB behaves exactly as before.
+
+Lifecycle hooks prepare the immutable profile first. OpenAB then validates the
+profile after `pre_seed` and `pre_boot`, but before secret resolution and agent
+pool creation. A validation or doctor failure stops startup.
+
+```toml
+[agent]
+command = "hermes-acp"
+working_dir = "/home/agent"
+
+[agent.profile]
+root = "/home/team-hermes-profile"
+state_dir = "/home/agent"
+manifest = "manifest.toml"                # default
+doctor = "checks/verify-profile.sh"       # optional, relative to root
+doctor_timeout_seconds = 60               # 0 disables the timeout
+scan_credentials = true                   # default
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `root` | string | required | Absolute immutable profile directory prepared by a volume, init container, `pre_seed`, or `pre_boot`. |
+| `state_dir` | string | required | Absolute mutable Hermes state directory. It must exist and must not equal, contain, or be contained by `root`. |
+| `manifest` | string | `"manifest.toml"` | Manifest path relative to `root`. Absolute paths and traversal components are rejected. |
+| `doctor` | string | absent | Optional executable compatibility doctor relative to `root`. It must be read-only and return non-zero on incompatibility. |
+| `doctor_timeout_seconds` | u64 | `60` | Maximum doctor runtime. `0` waits without a timeout. |
+| `scan_credentials` | bool | `true` | Reject managed files with sensitive filenames or common credential patterns. Disable only after a security review. |
+
+The manifest schema is strict:
+
+```toml
+schema_version = 1
+name = "team-hermes"
+version = "2026.09.04"
+runtime = "hermes"
+runtime_version = "2026.8.31"
+required_paths = ["config/config.yaml", "instructions/AGENTS.md", "skills"]
+managed_paths = ["config", "instructions", "skills", "scripts", "cron"]
+```
+
+`required_paths` and `managed_paths` are relative to `root`. When credential
+scanning is enabled, OpenAB scans the complete profile root rather than trusting
+the manifest to enumerate every file. Symlinks, files larger than 1 MiB, and
+profiles exceeding 10,000 scanned files are rejected, keeping the startup check
+bounded.
+
+The doctor receives only the normal child-process baseline (`HOME`, `PATH`,
+`USER`) and these non-secret metadata variables:
+
+- `OPENAB_PROFILE_ROOT`
+- `OPENAB_PROFILE_NAME`
+- `OPENAB_PROFILE_VERSION`
+- `OPENAB_PROFILE_RUNTIME`
+- `OPENAB_PROFILE_RUNTIME_VERSION`
+- `OPENAB_STATE_DIR`
+- `OPENAB_AGENT_COMMAND`
+
+It does not inherit Slack tokens, provider credentials, or arbitrary OpenAB
+environment variables. Environment scrubbing is not a filesystem sandbox: the
+doctor can still access files readable by the OpenAB user, including state under
+`HOME`. The doctor contract also cannot technically prevent writes, so only run
+a reviewed profile-owned executable.
+
+OpenAB still uses one `hermes-acp` subprocess per active session. If
+`pool.max_sessions > 1`, startup logs a concurrency warning. The profile gate
+does not claim that Hermes state databases are multi-process safe; validate
+that property before sharing one `state_dir` across concurrent sessions.
 
 ---
 

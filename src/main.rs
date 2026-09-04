@@ -464,6 +464,12 @@ async fn main() -> anyhow::Result<()> {
         hooks::validate_hook("pre_shutdown", hook)?;
     }
 
+    // Validate an opt-in existing agent profile only after pre_seed/pre_boot
+    // have prepared it, and before secrets or agent subprocesses exist. This
+    // keeps immutable profile assets separate from mutable runtime state and
+    // lets a compatibility doctor fail closed during startup.
+    openab_core::agent_profile::validate_and_report(&cfg.agent, cfg.pool.max_sessions).await?;
+
     // Resolve secrets (after pre_boot hooks so exec:// scripts are available)
     if !cfg.secrets.refs.is_empty() {
         let resolved = secrets::resolve(&cfg.secrets).await?;

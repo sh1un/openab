@@ -1,0 +1,19 @@
+[agent]
+command = "hermes-acp"
+working_dir = "/home/agent"
+
+[agent.profile]
+root = "/home/team-hermes-profile"
+state_dir = "/home/agent"
+doctor = "checks/verify-profile.sh"
+doctor_timeout_seconds = 30
+scan_credentials = true
+
+[hooks.pre_boot]
+# This example profile must already be mounted or extracted before pre_boot.
+script = "/home/team-hermes-profile/checks/install-profile.sh"
+on_failure = "abort"
+
+[pool]
+# Start with one session until Hermes mutable-state concurrency is verified.
+max_sessions = 1
