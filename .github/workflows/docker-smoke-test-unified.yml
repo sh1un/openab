@@ -124,6 +124,17 @@ jobs:
             '.result.agentInfo.name == "@agentclientprotocol/codex-acp"' \
             >/dev/null
 
+      - name: Verify Hermes Anthropic provider is preinstalled
+        if: matrix.target.name == 'hermes'
+        run: |
+          HERMES_ANTHROPIC_VERSION=$(awk -F= '$1 == "ARG HERMES_ANTHROPIC_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$HERMES_ANTHROPIC_VERSION"
+          docker run --rm \
+            --entrypoint /usr/local/lib/hermes-agent/venv/bin/python \
+            openab-unified-hermes:test \
+            -c 'import importlib.metadata; print(importlib.metadata.version("anthropic"))' \
+            | grep -Fx "$HERMES_ANTHROPIC_VERSION"
+
       - name: Verify Kimi runtime version
         if: matrix.target.name == 'kimi'
         run: |

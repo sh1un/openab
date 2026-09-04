@@ -1,0 +1,7 @@
+schema_version = 1
+name = "example-hermes"
+version = "2026.09.04"
+runtime = "hermes"
+runtime_version = "2026.8.31"
+required_paths = ["config/config.yaml", "checks/install-profile.sh", "checks/verify-profile.sh"]
+managed_paths = ["config", "checks"]

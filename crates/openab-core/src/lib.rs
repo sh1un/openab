@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod agent_profile;
 pub mod adapter;
 #[cfg(feature = "acp-mcp")]
 pub mod acp_mcp;

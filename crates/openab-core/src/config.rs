@@ -121,6 +121,21 @@ pub struct McpFacadeConfig {
     pub tunnel_timeout_seconds: u64,
 }
 
+/// Public HTTPS callback listener (normally behind a TLS-terminating ingress)
+/// used by the optional AgentCore Identity user-federation flow. The handler
+/// does not bind identity by itself; it emits a one-time code that must be
+/// confirmed from the originating authenticated chat turn.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCoreIdentityCallbackConfig {
+    #[serde(default = "default_agentcore_identity_callback_listen")]
+    pub listen: String,
+}
+
+fn default_agentcore_identity_callback_listen() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
 /// Public so the binary can use the same value instead of repeating the literal. A private
 /// default plus an `unwrap_or(180)` at the call site is two records of one fact, and the one in
 /// the binary would silently keep the old number the day this changes.
@@ -248,6 +263,9 @@ pub struct Config {
     /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
     /// the opt-in signal: absent = no facade, no listener, no new behavior.
     pub mcp: Option<McpFacadeConfig>,
+    /// Optional public callback for AgentCore Identity OAuth 3LO. Absent means
+    /// no public listener and no change for broker-only deployments.
+    pub agentcore_identity_callback: Option<AgentCoreIdentityCallbackConfig>,
     /// Optional end-user identity propagation. Absent preserves the previous
     /// behavior: no request identity is resolved or sent downstream.
     pub identity: Option<IdentityPropagationConfig>,
@@ -1668,6 +1686,7 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    profile: Option<AgentProfileConfig>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1678,8 +1697,42 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            profile: None,
         }
     }
+}
+
+/// Opt-in adoption contract for an existing agent profile.
+///
+/// The profile is immutable, non-secret input prepared by `pre_seed` / `pre_boot`.
+/// Mutable credentials, sessions, memory, and workspaces belong under `state_dir`.
+/// Keeping the paths separate prevents an archive refresh from overwriting live state.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileConfig {
+    /// Absolute directory containing the immutable profile and its manifest.
+    pub root: String,
+    /// Absolute directory containing mutable runtime state.
+    pub state_dir: String,
+    /// Manifest path relative to `root`.
+    #[serde(default = "default_agent_profile_manifest")]
+    pub manifest: String,
+    /// Optional read-only compatibility check, relative to `root`.
+    pub doctor: Option<String>,
+    /// Maximum doctor runtime in seconds.
+    #[serde(default = "default_agent_profile_doctor_timeout")]
+    pub doctor_timeout_seconds: u64,
+    /// Scan the complete profile tree for common credential material.
+    #[serde(default = "default_true")]
+    pub scan_credentials: bool,
+}
+
+fn default_agent_profile_manifest() -> String {
+    "manifest.toml".into()
+}
+
+fn default_agent_profile_doctor_timeout() -> u64 {
+    60
 }
 
 #[derive(Debug)]
@@ -1689,6 +1742,7 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    pub profile: Option<AgentProfileConfig>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -1701,6 +1755,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            profile: None,
             command_explicit: false,
         }
     }
@@ -1727,6 +1782,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            profile: raw.profile,
             command_explicit: cmd_explicit,
         })
     }
@@ -2306,6 +2362,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 working_dir: config.agent.working_dir.clone(),
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                profile: config.agent.profile.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -2559,6 +2616,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn agentcore_identity_callback_is_opt_in_with_safe_container_default() {
+        let absent = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(absent.agentcore_identity_callback.is_none());
+
+        let configured = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[agentcore_identity_callback]\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            configured
+                .agentcore_identity_callback
+                .expect("section enables callback")
+                .listen,
+            "0.0.0.0:8080"
+        );
     }
     use std::io::Write;
 
@@ -3424,8 +3500,57 @@ command = "echo"
         let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
+        assert!(cfg.agent.profile.is_none());
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn agent_profile_parses_as_opt_in_nested_config() {
+        let config = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "hermes-acp"
+
+[agent.profile]
+root = "/opt/team-hermes-profile"
+state_dir = "/home/agent"
+doctor = "checks/verify-profile.sh"
+"#,
+            "test",
+        )
+        .unwrap();
+        let profile = config.agent.profile.expect("agent profile");
+        assert_eq!(profile.root, "/opt/team-hermes-profile");
+        assert_eq!(profile.state_dir, "/home/agent");
+        assert_eq!(profile.manifest, "manifest.toml");
+        assert_eq!(profile.doctor.as_deref(), Some("checks/verify-profile.sh"));
+        assert_eq!(profile.doctor_timeout_seconds, 60);
+        assert!(profile.scan_credentials);
+    }
+
+    #[test]
+    fn agent_profile_rejects_unknown_fields() {
+        let error = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "hermes-acp"
+
+[agent.profile]
+root = "/opt/team-hermes-profile"
+state_dir = "/home/agent"
+secrets = true
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

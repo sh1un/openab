@@ -83,6 +83,27 @@ fn expand_env(val: &str) -> String {
         val.to_string()
     }
 }
+
+#[cfg(feature = "acp-mcp")]
+fn facade_mcp_server(url: &str, token: &str) -> Value {
+    json!({
+        "name": "openab",
+        "type": "http",
+        "url": url,
+        "headers": [{
+            "name": "X-OpenAB-Session-Token",
+            "value": token,
+        }],
+    })
+}
+
+fn acp_debug_payload(data: &str) -> &str {
+    if data.contains("X-OpenAB-Session-Token") {
+        "<redacted ACP MCP session credentials>"
+    } else {
+        data.trim()
+    }
+}
 use tokio::time::Instant;
 
 /// A content block for the ACP prompt — either text or image.
@@ -187,6 +208,9 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
+    /// MCP servers delivered through the ACP session contract. This stays
+    /// empty unless the broker has an active per-session Facade credential.
+    session_mcp_servers: Vec<Value>,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
@@ -491,6 +515,7 @@ impl AcpConnection {
             last_active: Instant::now(),
             activity,
             session_reset: false,
+            session_mcp_servers: Vec::new(),
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
@@ -504,12 +529,20 @@ impl AcpConnection {
         self.facade_token_guard = guard;
     }
 
+    /// Deliver the loopback Facade through ACP `mcpServers` with the exact
+    /// credential minted for this agent session. The token is process-local
+    /// and never written to the shared workdir.
+    #[cfg(feature = "acp-mcp")]
+    pub fn set_facade_mcp_server(&mut self, url: &str, token: &str) {
+        self.session_mcp_servers = vec![facade_mcp_server(url, token)];
+    }
+
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
-        debug!(data = data.trim(), "acp_send");
+        debug!(data = acp_debug_payload(data), "acp_send");
         // A hung agent can stop draining stdin; bound the write so callers
         // (and the mutexes they hold) can never block on it indefinitely.
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -579,8 +612,12 @@ impl AcpConnection {
     }
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+        let mcp_servers = self.session_mcp_servers.clone();
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request(
+                "session/new",
+                Some(json!({"cwd": cwd, "mcpServers": mcp_servers})),
+            )
             .await?;
 
         let session_id = resp
@@ -794,10 +831,15 @@ impl AcpConnection {
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
     pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+        let mcp_servers = self.session_mcp_servers.clone();
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers,
+                })),
             )
             .await?;
         // Accept any non-error response as success
@@ -852,7 +894,9 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    #[cfg(feature = "acp-mcp")]
+    use super::facade_mcp_server;
+    use super::{acp_debug_payload, build_agent_env, build_permission_response, pick_best_option};
     use serde_json::json;
 
     #[test]
@@ -984,6 +1028,27 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+
+    #[cfg(feature = "acp-mcp")]
+    #[test]
+    fn facade_server_matches_acp_http_schema_and_keeps_token_in_header_only() {
+        let server = facade_mcp_server("http://127.0.0.1:8848/mcp", "session-secret");
+        assert_eq!(server["name"], "openab");
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://127.0.0.1:8848/mcp");
+        assert_eq!(server["headers"][0]["name"], "X-OpenAB-Session-Token");
+        assert_eq!(server["headers"][0]["value"], "session-secret");
+        assert!(server.get("command").is_none());
+    }
+
+    #[test]
+    fn acp_debug_logging_redacts_facade_session_credentials() {
+        let payload = r#"{"mcpServers":[{"headers":[{"name":"X-OpenAB-Session-Token","value":"session-secret"}]}]}"#;
+        let redacted = acp_debug_payload(payload);
+        assert_eq!(redacted, "<redacted ACP MCP session credentials>");
+        assert!(!redacted.contains("session-secret"));
+        assert_eq!(acp_debug_payload("  ordinary  "), "ordinary");
     }
 }
 

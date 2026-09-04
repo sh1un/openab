@@ -439,10 +439,18 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   existing `mcp` meta-tool. No HTTP hop is required because the facade
   contract and policy checks are implemented by the same dispatcher component
   (see §6.4).
-- **ACP `session/new` `mcpServers` advertisement** (OAB injecting the facade
-  URL into the agent session it spawns) is a follow-up on top of this
-  transport, not a prerequisite: the loopback URL is already reachable by any
-  CLI the operator points at it.
+- **ACP `session/new` and `session/load` `mcpServers` advertisement:** OAB
+  injects the Facade URL and the session-scoped `X-OpenAB-Session-Token` header
+  into every agent session it spawns. This is the preferred delivery path for
+  ACP agents because it binds the Facade credential to the correct session
+  without editing the CLI's persistent config. ACP payload logging redacts the
+  credential.
+- **Codex compatibility:** Codex 0.144.x accepts a per-thread MCP URL from
+  `codex-acp` but may omit its per-thread HTTP headers. For `codex-acp` only,
+  the broker therefore mirrors the same URL and session token into the child
+  process's in-memory `CODEX_CONFIG.http_headers`. The value is neither written
+  to the workdir nor logged, malformed config fails closed, and all other ACP
+  agents continue to use the standard advertisement alone.
 
 This is the same architectural role that
 [`acp-server-websocket-reverse-mcp.md`](./acp-server-websocket-reverse-mcp.md)

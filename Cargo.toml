@@ -44,6 +44,9 @@ agentcore = ["openab-core/agentcore"]
 config-s3 = ["openab-core/config-s3"]
 pre-seed = ["openab-core/pre-seed"]
 filestore = ["openab-core/filestore"]
+# Opt-in managed downstream OAuth exchange. Not part of `default`: deployments
+# may keep using an external credential broker without AWS Identity libraries.
+agentcore-identity = ["openab-mcp/agentcore-identity"]
 
 # Gateway adapters (each pulls in the gateway crate + axum for embedded server)
 telegram = ["dep:openab-gateway", "dep:axum", "openab-gateway/telegram"]

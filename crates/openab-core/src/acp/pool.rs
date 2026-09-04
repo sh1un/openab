@@ -175,6 +175,51 @@ async fn setup_facade_session(
     }
 }
 
+/// Codex 0.144.x accepts ACP `mcpServers` URLs but does not consistently apply
+/// per-thread `http_headers`. `codex-acp` is one process per OpenAB session, so
+/// mirror the same session-scoped Facade entry into that process's
+/// `CODEX_CONFIG`. The token remains process-local and is never persisted.
+#[cfg(feature = "acp-mcp")]
+fn inject_codex_facade_config(
+    env: &mut HashMap<String, String>,
+    command: &str,
+    facade_url: &str,
+    token: &str,
+) -> Result<()> {
+    let is_codex_acp = Path::new(command)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex-acp"));
+    if !is_codex_acp {
+        return Ok(());
+    }
+
+    let mut config: serde_json::Value = match env.get("CODEX_CONFIG") {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| anyhow!("CODEX_CONFIG must be valid JSON: {error}"))?,
+        None => serde_json::json!({}),
+    };
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("CODEX_CONFIG root must be a JSON object"))?;
+    let servers = root
+        .entry("mcp_servers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("CODEX_CONFIG mcp_servers must be a JSON object"))?;
+    servers.insert(
+        "openab".into(),
+        serde_json::json!({
+            "url": facade_url,
+            "http_headers": {
+                "X-OpenAB-Session-Token": token,
+            },
+        }),
+    );
+    env.insert("CODEX_CONFIG".into(), serde_json::to_string(&config)?);
+    Ok(())
+}
+
 /// Remove every non-`active` pool entry for `key`.
 ///
 /// The single implementation for both hung eviction and [`SessionPool::reset_session`]; the latter
@@ -548,6 +593,14 @@ impl SessionPool {
                 // The static facade MCP entry references ${OPENAB_SESSION_TOKEN};
                 // the value lives only in this agent process's environment.
                 env.insert("OPENAB_SESSION_TOKEN".to_string(), tok.clone());
+                if let Some(facade_url) = self.facade_url.as_deref() {
+                    inject_codex_facade_config(
+                        &mut env,
+                        &self.config.command,
+                        facade_url,
+                        tok,
+                    )?;
+                }
             }
             env
         };
@@ -561,6 +614,13 @@ impl SessionPool {
             &self.config.inherit_env,
         )
         .await?;
+
+        #[cfg(feature = "acp-mcp")]
+        if let (Some(facade_url), Some(token)) =
+            (self.facade_url.as_deref(), session_token.as_deref())
+        {
+            new_conn.set_facade_mcp_server(facade_url, token);
+        }
 
         new_conn.initialize().await?;
 
@@ -1090,6 +1150,8 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "acp-mcp")]
+    use super::inject_codex_facade_config;
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
         remove_if_same_handle, PoolState,
@@ -1124,6 +1186,67 @@ mod tests {
         fn revoke(&self, token: &str) {
             self.revoked.lock().unwrap().push(token.to_string());
         }
+    }
+
+    #[cfg(feature = "acp-mcp")]
+    #[test]
+    fn codex_acp_gets_process_local_facade_headers_without_losing_existing_config() {
+        let mut env = HashMap::from([(
+            "CODEX_CONFIG".to_string(),
+            r#"{"mcp_servers":{"atlassian":{"enabled":false}},"features":{"apps":false}}"#
+                .to_string(),
+        )]);
+
+        inject_codex_facade_config(
+            &mut env,
+            "/usr/local/bin/codex-acp",
+            "http://127.0.0.1:8848/mcp",
+            "session-secret",
+        )
+        .unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert_eq!(config["features"]["apps"], false);
+        assert_eq!(config["mcp_servers"]["atlassian"]["enabled"], false);
+        assert_eq!(
+            config["mcp_servers"]["openab"]["url"],
+            "http://127.0.0.1:8848/mcp"
+        );
+        assert_eq!(
+            config["mcp_servers"]["openab"]["http_headers"]
+                ["X-OpenAB-Session-Token"],
+            "session-secret"
+        );
+    }
+
+    #[cfg(feature = "acp-mcp")]
+    #[test]
+    fn non_codex_agents_do_not_receive_codex_config() {
+        let mut env = HashMap::new();
+        inject_codex_facade_config(
+            &mut env,
+            "kiro-cli",
+            "http://127.0.0.1:8848/mcp",
+            "session-secret",
+        )
+        .unwrap();
+        assert!(!env.contains_key("CODEX_CONFIG"));
+    }
+
+    #[cfg(feature = "acp-mcp")]
+    #[test]
+    fn invalid_codex_config_fails_before_starting_an_unauthenticated_session() {
+        let mut env = HashMap::from([("CODEX_CONFIG".to_string(), "not-json".to_string())]);
+        let error = inject_codex_facade_config(
+            &mut env,
+            "codex-acp",
+            "http://127.0.0.1:8848/mcp",
+            "session-secret",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be valid JSON"));
+        assert_eq!(env.get("CODEX_CONFIG").map(String::as_str), Some("not-json"));
     }
 
     /// Build an empty `PoolState` for a helper-level test.

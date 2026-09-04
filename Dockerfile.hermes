@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # HERMES_HOME points to agent user's data dir for OAuth tokens and config
 ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
 ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
+ARG HERMES_ANTHROPIC_VERSION=0.87.0
 RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
       -o /tmp/install-hermes.sh && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
@@ -38,6 +39,13 @@ RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HE
     rm /tmp/install-hermes.sh && \
     (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
     ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
+
+# Hermes intentionally lazy-installs provider SDKs. Containers run as a
+# non-root user with a read-only root filesystem, so bake the selected provider
+# into the immutable image instead of allowing a runtime package install.
+RUN VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv \
+      /home/agent/.hermes/bin/uv pip install "anthropic==${HERMES_ANTHROPIC_VERSION}" && \
+    /usr/local/lib/hermes-agent/venv/bin/python -c 'import anthropic'
 
 # Install gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

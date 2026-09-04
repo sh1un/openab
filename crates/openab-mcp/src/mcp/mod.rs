@@ -1,5 +1,7 @@
 //! Native MCP client. See `docs/adr/openab-agent-mcp.md`.
 
+#[cfg(feature = "agentcore-identity")]
+pub mod agentcore_identity;
 pub mod breaker;
 pub mod config;
 pub mod credential;

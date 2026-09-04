@@ -42,7 +42,16 @@ rmcp = { version = "1.7", default-features = false, features = [
 ] }
 # Serves the facade's Streamable HTTP endpoint (rmcp's StreamableHttpService
 # is a tower Service; axum provides the loopback listener + router).
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+aws-config = { version = "1", optional = true }
+aws-sdk-bedrockagentcore = { version = "1", optional = true }
+
+[features]
+default = []
+agentcore-identity = [
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockagentcore",
+]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

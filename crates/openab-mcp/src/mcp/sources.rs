@@ -12,10 +12,12 @@
 //!   construction (no `mcp.json` entry, no extra listener, no subprocess).
 //!   Sources receive an optional [`SessionCtx`] on every call.
 //! - [`SessionTokens`] — the broker↔facade contract for identity: the broker
-//!   mints one opaque token per agent session (written into that agent's MCP
-//!   client config as an `Authorization: Bearer` header) and revokes it on
-//!   session evict. The facade resolves the header back to a [`SessionCtx`]
-//!   per request via the HTTP parts rmcp injects into request extensions.
+//!   mints one opaque token per agent session and revokes it on session evict.
+//!   The facade resolves either `Authorization: Bearer <token>` or
+//!   `X-OpenAB-Session-Token: <token>` back to a [`SessionCtx`] per request via
+//!   the HTTP parts rmcp injects into request extensions. The dedicated header
+//!   supports MCP clients that load HTTP header values directly from
+//!   environment variables without adding an authorization scheme.
 //!
 //! Anonymous clients (no/unknown token) keep working unchanged: they see the
 //! host-level catalog plus any sources with `requires_session() == false`.
@@ -150,18 +152,24 @@ impl SessionTokens {
             .remove(token);
     }
 
-    pub fn activate_request(
-        &self,
-        token: &str,
-        request: openab_context::ResolvedRequestContext,
-    ) {
-        if let Some(ctx) = self.inner.write().expect("session token lock").get_mut(token) {
+    pub fn activate_request(&self, token: &str, request: openab_context::ResolvedRequestContext) {
+        if let Some(ctx) = self
+            .inner
+            .write()
+            .expect("session token lock")
+            .get_mut(token)
+        {
             ctx.request = Some(request);
         }
     }
 
     pub fn clear_request(&self, token: &str) {
-        if let Some(ctx) = self.inner.write().expect("session token lock").get_mut(token) {
+        if let Some(ctx) = self
+            .inner
+            .write()
+            .expect("session token lock")
+            .get_mut(token)
+        {
             ctx.request = None;
         }
     }
@@ -199,21 +207,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Resolve a [`SessionCtx`] from the HTTP parts rmcp injects into request
 /// extensions (`http::request::Parts`, see rmcp streamable-http server
-/// docs): `Authorization: Bearer <token>` → token registry lookup. Absent
-/// parts (non-HTTP transports), absent/malformed header, or an unknown
-/// token all resolve to `None` — the anonymous, host-level view.
+/// docs): `Authorization: Bearer <token>` or
+/// `X-OpenAB-Session-Token: <token>` → token registry lookup. The standard
+/// Authorization header wins when both are present. Absent parts (non-HTTP
+/// transports), absent/malformed headers, or an unknown token all resolve to
+/// `None` — the anonymous, host-level view.
 pub fn session_ctx_from_extensions(
     extensions: &rmcp::model::Extensions,
     tokens: &SessionTokens,
 ) -> Option<SessionCtx> {
     let parts = extensions.get::<axum::http::request::Parts>()?;
-    let bearer = parts
+    if let Some(value) = parts.headers.get(axum::http::header::AUTHORIZATION) {
+        let bearer = value.to_str().ok()?.strip_prefix("Bearer ")?;
+        return tokens.resolve(bearer);
+    }
+    let dedicated = parts
         .headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")?;
-    tokens.resolve(bearer)
+        .get("x-openab-session-token")
+        .and_then(|value| value.to_str().ok());
+    tokens.resolve(dedicated?)
 }
 
 #[cfg(test)]
@@ -251,18 +263,36 @@ mod tests {
         tokens.activate_request(&hr_token, request("req-hr", "employee-002"));
 
         assert_eq!(
-            tokens.resolve(&cloud_token).unwrap().request.unwrap().identity.subject,
+            tokens
+                .resolve(&cloud_token)
+                .unwrap()
+                .request
+                .unwrap()
+                .identity
+                .subject,
             "employee-001"
         );
         assert_eq!(
-            tokens.resolve(&hr_token).unwrap().request.unwrap().identity.subject,
+            tokens
+                .resolve(&hr_token)
+                .unwrap()
+                .request
+                .unwrap()
+                .identity
+                .subject,
             "employee-002"
         );
 
         tokens.clear_request(&cloud_token);
         assert!(tokens.resolve(&cloud_token).unwrap().request.is_none());
         assert_eq!(
-            tokens.resolve(&hr_token).unwrap().request.unwrap().identity.subject,
+            tokens
+                .resolve(&hr_token)
+                .unwrap()
+                .request
+                .unwrap()
+                .identity
+                .subject,
             "employee-002",
             "clearing session A must not change session B"
         );
@@ -355,22 +385,44 @@ mod tests {
     fn ctx_resolution_from_http_parts() {
         let tokens = SessionTokens::new();
         let tok = tokens.mint("chan-b");
-        let make_ext = |auth: Option<String>| {
+        let make_ext = |auth: Option<String>, dedicated: Option<String>| {
             let mut b = axum::http::Request::builder().uri("/mcp");
             if let Some(a) = auth {
                 b = b.header(axum::http::header::AUTHORIZATION, a);
+            }
+            if let Some(value) = dedicated {
+                b = b.header("x-openab-session-token", value);
             }
             let (parts, ()) = b.body(()).unwrap().into_parts();
             let mut ext = rmcp::model::Extensions::new();
             ext.insert(parts);
             ext
         };
-        let ctx = session_ctx_from_extensions(&make_ext(Some(format!("Bearer {tok}"))), &tokens);
+        let ctx =
+            session_ctx_from_extensions(&make_ext(Some(format!("Bearer {tok}")), None), &tokens);
+        assert_eq!(ctx.unwrap().channel_id, "chan-b");
+        let ctx = session_ctx_from_extensions(&make_ext(None, Some(tok.clone())), &tokens);
         assert_eq!(ctx.unwrap().channel_id, "chan-b");
         assert!(
-            session_ctx_from_extensions(&make_ext(Some("Bearer wrong".into())), &tokens).is_none()
+            session_ctx_from_extensions(
+                &make_ext(Some("Bearer wrong".into()), Some(tok.clone())),
+                &tokens
+            )
+            .is_none(),
+            "a malformed or unknown Authorization header must not fall back to the dedicated header"
         );
-        assert!(session_ctx_from_extensions(&make_ext(None), &tokens).is_none());
+        assert!(
+            session_ctx_from_extensions(
+                &make_ext(Some("Basic wrong".into()), Some(tok.clone())),
+                &tokens
+            )
+            .is_none(),
+            "a non-Bearer Authorization header must not fall back to the dedicated header"
+        );
+        assert!(
+            session_ctx_from_extensions(&make_ext(None, Some("wrong".into())), &tokens).is_none()
+        );
+        assert!(session_ctx_from_extensions(&make_ext(None, None), &tokens).is_none());
         // No http parts at all (e.g. non-HTTP transport) → anonymous.
         assert!(session_ctx_from_extensions(&rmcp::model::Extensions::new(), &tokens).is_none());
     }

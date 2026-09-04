@@ -1,0 +1,3 @@
+# Non-secret, profile-owned Hermes configuration example.
+security:
+  allow_lazy_installs: false

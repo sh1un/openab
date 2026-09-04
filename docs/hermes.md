@@ -186,6 +186,44 @@ volumeMounts:
     mountPath: /home/agent/.hermes
 ```
 
+## Adopting an Existing Hermes Setup
+
+Do not copy an existing writable Hermes home into the OpenAB image or mount the
+same live home into both `hermes gateway run` and OpenAB. OpenAB uses a
+per-session `hermes-acp` process model, so sharing auth, session, memory, cron,
+or SQLite state without first testing concurrent access can corrupt state or
+run automation more than once.
+
+Use the opt-in `[agent.profile]` contract to separate four concerns:
+
+| Concern | Location |
+|---------|----------|
+| OpenAB and Hermes binaries | Pinned runtime image |
+| Personality, instructions, skills, scripts, cron definitions | Immutable non-secret profile |
+| Auth, sessions, memory, workspace, generated files | Persistent mutable state directory |
+| API keys and OAuth credentials | Runtime secret injection |
+
+A minimal adoption flow is:
+
+1. Inventory the existing Hermes home without copying credential values.
+2. Extract only reviewed non-secret behavior into a versioned profile.
+3. Mount or seed that profile at a path separate from the Hermes state PVC.
+4. Configure `[agent.profile]` and keep its default credential scan enabled.
+5. Add a read-only doctor that verifies the exact Hermes version and required integrations.
+6. Canary with isolated state and explicit test users before any cutover.
+7. Test two concurrent ACP sessions before increasing `pool.max_sessions`.
+
+See [`examples/hermes-existing-profile`](examples/hermes-existing-profile) for
+a manifest, doctor, and OpenAB config fragment. The complete field reference is
+in [Configuration Reference: `[agent.profile]`](config-reference.md#agentprofile),
+and the responsibility boundary is recorded in
+[ADR: Existing Hermes Profile Adoption](adr/existing-hermes-profile.md).
+
+Lifecycle hooks are delivery mechanisms, not secret stores. `pre_seed` may
+download a checksummed profile archive and `pre_boot` may install it
+idempotently, but neither archive should contain `.env`, auth files, refresh
+tokens, memory databases, or a complete Hermes home.
+
 ## Advantages
 
 - **Cost**: SuperGrok $30/mo flat rate vs pay-per-token API pricing

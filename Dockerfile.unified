@@ -38,12 +38,12 @@ RUN mkdir -p src crates/openab-context/src crates/openab-core/src crates/openab-
     && echo '' > crates/openab-core/src/lib.rs \
     && echo '' > crates/openab-gateway/src/lib.rs \
     && echo '' > crates/openab-mcp/src/lib.rs \
-    && cargo build --release --features unified \
+    && cargo build --release --features unified,agentcore-identity \
     && rm -rf src crates/openab-context/src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
 COPY crates/ crates/
 COPY src/ src/
 RUN touch src/main.rs crates/openab-context/src/lib.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs \
-    && cargo build --release --features unified
+    && cargo build --release --features unified,agentcore-identity
 # Build openab-agent (used by native variant) — copied late to avoid cache busts
 COPY openab-agent/ openab-agent/
 RUN cd openab-agent && { grep -q '^\[workspace\]' Cargo.toml || printf '\n[workspace]\n' >> Cargo.toml; } && cargo build --release
@@ -294,6 +294,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
 ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
+ARG HERMES_ANTHROPIC_VERSION=0.87.0
 RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
       -o /tmp/install-hermes.sh && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
@@ -301,6 +302,9 @@ RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HE
     rm /tmp/install-hermes.sh && \
     (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
     ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
+RUN VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv \
+      /home/agent/.hermes/bin/uv pip install "anthropic==${HERMES_ANTHROPIC_VERSION}" && \
+    /usr/local/lib/hermes-agent/venv/bin/python -c 'import anthropic'
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \

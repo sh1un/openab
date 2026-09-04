@@ -421,6 +421,7 @@ pub struct CatalogEntry {
     pub name: String,
     pub transport: &'static str,
     pub requires_oauth: bool,
+    pub credential_provider: Option<super::credential::CredentialProviderConfig>,
 }
 
 /// Owns one `ServerHandle` per configured server, behind an async `RwLock`
@@ -521,6 +522,7 @@ impl McpRuntimeManager {
                 name: name.clone(),
                 transport: config.transport_label(),
                 requires_oauth: config.requires_oauth(),
+                credential_provider: config.credential_provider().cloned(),
             })
             .collect();
         catalog.sort_by(|a, b| a.name.cmp(&b.name));
@@ -774,7 +776,17 @@ impl McpRuntimeManager {
         let Some(provider_config) = server.credential_provider().cloned() else {
             return Ok(None);
         };
-        let credential = super::credential::from_config(&provider_config)?.credential(context)?;
+        let outcome = super::credential::from_config(&provider_config)?
+            .credential(context)
+            .await?;
+        let credential = match outcome {
+            super::credential::CredentialOutcome::Bearer(credential) => credential,
+            super::credential::CredentialOutcome::AuthorizationRequired { authorization_url } => {
+                anyhow::bail!(
+                    "authorization required for MCP server {name:?}; open this URL, complete consent, then retry: {authorization_url}"
+                )
+            }
+        };
         if let ServerConfig::Http {
             credential_provider,
             bearer_token,
